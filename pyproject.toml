@@ -1,0 +1,35 @@
+[project]
+name = "pocketchange"
+version = "0.1.0"
+description = "Bounded, revocable spending authority for AI agents"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "pynacl",
+  "pyjwt",
+  "httpx",
+  "pydantic",
+]
+
+[project.optional-dependencies]
+biscuit = ["biscuit-python"]
+gcp = ["google-cloud-firestore"]
+agent = ["google-adk", "google-genai"]
+trace = ["langfuse", "openinference-instrumentation-google-adk"]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[project.scripts]
+pocketchange = "pocketchange.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Several top-level directories (agent, merchant, eval, spike, scripts) are not
+# importable packages, so auto-discovery cannot tell which one to ship.
+packages = ["pocketchange", "agent", "merchant"]
