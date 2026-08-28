@@ -1,0 +1,52 @@
+# Two stages: build the console with Node, run the gateway with Python. The
+# image carries no Node runtime and no source for the frontend, only its dist.
+
+FROM node:22-slim AS console
+WORKDIR /console
+COPY frontend/package.json frontend/package-lock.json ./
+# Not --omit=dev: vite is a devDependency, and this stage exists to run it. The
+# stage is discarded, so nothing here reaches the final image.
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+# The demo token is public by design: it gates writes so a crawler cannot drain
+# a shared free tier, and it ships inside a page anyone can read.
+ARG VITE_DEMO_TOKEN=""
+ENV VITE_DEMO_TOKEN=$VITE_DEMO_TOKEN
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# Python 3.12 exactly: biscuit-python has no 3.14 wheel and its source build
+# fails on PyO3 0.24. Pinning this in the image is not incidental.
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # The container filesystem is ephemeral, so a persisted root key would be a
+    # different key on every cold start - which is a silent revocation of every
+    # live mandate. Generating one per instance is the honest behaviour, and it
+    # is why the limitations say this belongs in a KMS.
+    POCKETCHANGE_EPHEMERAL_KEYS=1 \
+    # .env is not shipped. Cloud Run injects real environment variables, and a
+    # dotenv file baked into an image is a credential in a registry.
+    POCKETCHANGE_NO_DOTENV=1
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY pocketchange/ ./pocketchange/
+COPY agent/ ./agent/
+COPY merchant/ ./merchant/
+COPY eval/ ./eval/
+
+RUN pip install --no-cache-dir -e ".[biscuit,gcp,agent]"
+
+COPY --from=console /console/dist ./frontend/dist
+
+RUN useradd --create-home --uid 1001 runner && chown -R runner:runner /app
+USER runner
+
+# Cloud Run sets $PORT and will not always use 8080.
+ENV PORT=8080
+EXPOSE 8080
+CMD exec uvicorn pocketchange.gateway:app --host 0.0.0.0 --port ${PORT} --workers 1
