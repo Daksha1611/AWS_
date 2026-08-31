@@ -13,6 +13,16 @@ idempotency header on Orders creation - which is exactly the endpoint a checkout
 uses. So this layer is not defence in depth. On the order path it is the only
 defence there is.
 
+The fingerprint covers the cart AND the amount. It once covered only the cart,
+which meant the same basket at a different price hashed identical and the second
+call was handed the first receipt - a price change disappearing in silence.
+
+What remains after that is narrower and cannot be fixed by hashing harder: an
+honest repurchase of the same cart at the same price inside the TTL is, byte for
+byte, a retry. Nothing in the request distinguishes them. That is an
+authorisation question rather than a fingerprinting one, and it is settled in
+the gateway - see `next_occurrence` and PayRequest.repurchase.
+
 Two halves:
   derive_key()  turns "what is being attempted" into a stable fingerprint
   ReplayStore   remembers what a key already returned, so a repeat replays the
@@ -88,6 +98,29 @@ class ReplayStore:
         with self._lock:
             self._evict()
             return self._seen.get(key)
+
+    def next_occurrence(self, base_key: str) -> int:
+        """How many times this exact action has already been paid for.
+
+        A deliberate repeat purchase cannot be told apart from a retry by
+        looking at the request - the cart and the amount are identical, which is
+        the whole difficulty. Something has to number the repeats, and it cannot
+        be the caller: an agent that supplied its own occurrence would be
+        choosing its own idempotency key, which is exactly what `derive_key`
+        exists to refuse.
+
+        So the number is counted here, from payments this gateway actually
+        settled. The first repeat is occurrence 1, and its key is
+        `<base>#1`. Nothing an agent can send changes the answer.
+
+        Counting only survivors of the TTL is correct rather than convenient:
+        once the original has expired there is no replay left to be confused
+        with, so the disambiguation is not needed any more.
+        """
+        with self._lock:
+            self._evict()
+            prefix = f"{base_key}#"
+            return 1 + sum(1 for k in self._seen if k.startswith(prefix))
 
     def record(self, key: str, result: Any) -> Replay:
         """Remember a completed action.

@@ -372,6 +372,21 @@ class PayRequest(BaseModel):
         default=None, max_length=200,
         description="Identifier of the party being paid, e.g. a supplier id.",
     )
+    # Agent-supplied, and safe to be, because of what it cannot do. Setting it
+    # never settles anything: it routes a request that would otherwise be
+    # replayed to a person, instead of handing back the original receipt. An
+    # agent that sets it on every call earns itself a human reading every
+    # payment, which is the opposite of an escape hatch.
+    #
+    # This is the distinction that matters. `derive_key` refuses a caller-chosen
+    # idempotency KEY, because an agent could defeat replay protection by
+    # picking a fresh one. A caller-chosen FLAG is fine so long as its only
+    # reachable effect is to demand more authorisation than the default path,
+    # never less.
+    repurchase: bool = Field(
+        default=False,
+        description="Ask a person to authorise buying this same cart again.",
+    )
 
 
 class PayResponse(BaseModel):
@@ -1159,9 +1174,30 @@ def pay(
                    {"delegate": token.terminal_delegate(bearer)})
 
     # 5. reserve - cumulative spend and idempotency, in one lock
-    idem = derive_key(mandate_id=mid, tool="pay", payload=req.cart)
+    #
+    # The fingerprint covers the amount as well as the cart. With the cart alone
+    # the same basket at a different price hashed identical, so the second call
+    # was handed the first receipt and the price change vanished silently. The
+    # replay branch below never compared amounts, so nothing else would have
+    # caught it.
+    idem = derive_key(mandate_id=mid, tool="pay",
+                      payload={"cart": req.cart, "amount_paise": req.amount_paise})
     prior = state.replays.get(idem)
     if prior is not None:
+        # Amount and cart both match a payment already made inside the TTL.
+        # Ordinarily that is a retry and the honest answer is the original
+        # receipt. But it is also what an intentional second purchase of the
+        # same thing looks like, and the two are indistinguishable from the
+        # request alone - so the caller has to say which it meant.
+        #
+        # It cannot say so in a way that spends money. `repurchase` buys a
+        # question, not a charge: the occurrence number is assigned here, from
+        # our own count of settled payments, and the settlement waits on a
+        # person. An agent cannot reach the second charge by itself.
+        if req.repurchase:
+            return _open_repurchase(
+                mid=mid, actor=actor, base_key=idem, req=req, deny=deny,
+            )
         state.audit.append(
             mandate_id=mid, actor=actor, tool="pay", decision=Decision.ALLOWED,
             reason="replay: returning original result", context=req.context,
@@ -1305,6 +1341,62 @@ def pay(
             "monitor_ms": round(monitor_ms, 3),
         },
     ))
+
+
+def _open_repurchase(*, mid: str, actor: str, base_key: str, req, deny) -> None:
+    """Ask a person to authorise buying the same cart a second time.
+
+    Always raises - either 202 with an approval to answer, or a denial. There is
+    no path through this function that charges anybody, which is the property
+    that makes it safe for the agent to be the one asking.
+
+    The occurrence number comes from our own settled-payment count, never from
+    the request, so the key this eventually settles under is one the caller
+    could not have named. Budget is reserved and HELD while the question is
+    open, for the same reason an escalation holds it: a person saying yes ten
+    minutes later should not fail because something else spent the money in the
+    meantime.
+    """
+    occurrence = state.replays.next_occurrence(base_key)
+    key = f"{base_key}#{occurrence}"
+
+    # The repeat is a payment in its own right and is charged against the cap
+    # like any other. A mandate with nothing left cannot buy the same thing
+    # twice just because it once could.
+    try:
+        reservation = state.ledger.reserve(mid, req.amount_paise, key)
+    except InsufficientBudget as exc:
+        raise deny(
+            "cumulative budget exhausted",
+            402,
+            {"requested": exc.requested, "available": exc.available,
+             "cap": exc.cap, "committed": exc.committed},
+        ) from exc
+    except LedgerError as exc:
+        raise deny(f"ledger refused: {exc}", 409) from exc
+
+    reason = (f"repeat purchase: this cart was already paid for in this window; "
+              f"occurrence {occurrence}")
+    approval = state.approvals.open(
+        mandate_id=mid, kind="repurchase", reservation_id=reservation.id,
+        idempotency_key=key, amount_paise=req.amount_paise, cart=req.cart,
+        context=req.context, reason=reason, counterparty=req.counterparty or "",
+    )
+    entry = state.audit.append(
+        mandate_id=mid, actor=actor, tool="pay", decision=Decision.ESCALATED,
+        reason=reason, context=req.context, amount_paise=req.amount_paise,
+        detail={"approval_id": approval.id, "occurrence": occurrence,
+                "idempotency_key": key[:16],
+                "expires_at": approval.expires_at.isoformat()},
+    )
+    raise HTTPException(202, {
+        "status": "pending_approval",
+        "approval_id": approval.id,
+        "reason": reason,
+        "occurrence": occurrence,
+        "expires_at": approval.expires_at.isoformat(),
+        "audit_seq": entry.seq,
+    })
 
 
 def _settle(
@@ -1525,13 +1617,19 @@ def decide_approval(approval_id: str, req: ApprovalDecision) -> dict[str, Any]:
         _flag(approval.counterparty, counterparties.VETOED)
         return {"approval_id": approval.id, "status": "denied", "audit_seq": entry.seq}
 
+    # Why this payment stopped, recorded as what it actually was. A repeat
+    # purchase was held because it was a repeat, not because the monitor
+    # objected to it - writing "monitor: escalate" over both would put a
+    # judgement in the log that no monitor ever made.
+    held_by = "repurchase" if approval.kind == "repurchase" else "escalate"
     result = _settle(
         mandate_id=approval.mandate_id, reservation_id=approval.reservation_id,
         idempotency_key=approval.idempotency_key, amount_paise=approval.amount_paise,
         cart=approval.cart, context=approval.context,
         counterparty=approval.counterparty,
         detail={"approval_id": approval.id, "approved_by": req.by,
-                "monitor": "escalate", "monitor_reason": approval.reason},
+                "held_by": held_by, "monitor_reason": approval.reason,
+                "monitor": "escalate" if held_by == "escalate" else "not-consulted"},
     )
     return {"approval_id": approval.id, "status": "approved", **result}
 

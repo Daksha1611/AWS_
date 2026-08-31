@@ -12,6 +12,11 @@ set -euo pipefail
 
 REGION="${REGION:-asia-south1}"          # Mumbai — closest to Razorpay's rails
 SERVICE="${SERVICE:-pocket-change}"
+# The judgement layers - monitor and critic - already ask for tier="judge";
+# this is the only place that says what that tier actually is. Left unset,
+# VERTEX_JUDGE_MODEL falls back to the working model and the second opinion
+# is produced by the same model that made the decision.
+JUDGE_MODEL="${JUDGE_MODEL:-gemini-3.7-flash}"
 REPO="${REPO:-pocket-change}"
 
 say()  { printf "\033[1m%s\033[0m\n" "$*"; }
@@ -181,7 +186,7 @@ gcloud run deploy "$SERVICE" \
   `# between requests, and one instance is always warm.` \
   --no-cpu-throttling \
   --timeout=600 \
-  --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT,POCKETCHANGE_NO_DOTENV=1,POCKETCHANGE_EPHEMERAL_KEYS=1,POCKETCHANGE_VERTEX_LOCATION=$REGION" \
+  --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT,POCKETCHANGE_NO_DOTENV=1,POCKETCHANGE_EPHEMERAL_KEYS=1,POCKETCHANGE_VERTEX_LOCATION=$REGION,POCKETCHANGE_VERTEX_JUDGE_MODEL=$JUDGE_MODEL" \
   --set-secrets="RAZORPAY_KEY_ID=pc-razorpay-key-id:latest,RAZORPAY_KEY_SECRET=pc-razorpay-key-secret:latest,GEMINI_API_KEY=pc-gemini-api-key:latest,TAVILY_API_KEY=pc-tavily-api-key:latest,GROQ_API_KEY=pc-groq-api-key:latest,OPENROUTER_API_KEY=pc-openrouter-api-key:latest,CEREBRAS_API_KEY=pc-cerebras-api-key:latest,SAMBANOVA_API_KEY=pc-sambanova-api-key:latest,POCKETCHANGE_DEMO_TOKEN=pc-demo-token:latest" \
   --quiet
 

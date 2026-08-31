@@ -10,7 +10,7 @@ From the five-dimensional taxonomy in the SoK on autonomous financial agents
 (arXiv:2604.15367), Table 1. Each vector carries four things: whether it applies
 to this system, the mechanism, what defends it, and the test that proves it.
 
-Three are marked NOT APPLICABLE, with a mechanism-level reason rather than a
+Two are marked NOT APPLICABLE, with a mechanism-level reason rather than a
 convenient one. That is deliberate. The paper's corpus is largely DeFi and
 trading agents, where an agent holds a position it can move; this one buys rice
 at a listed price. Scoring twelve out of twelve on a grocery buyer would be a
