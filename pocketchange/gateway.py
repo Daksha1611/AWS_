@@ -1902,6 +1902,110 @@ def verify_audit() -> dict[str, Any]:
     }
 
 
+@app.get("/incident/{audit_seq}")
+def incident(audit_seq: int) -> dict[str, Any]:
+    """Everything known about one payment, assembled for someone investigating it.
+
+    The pieces already existed and were scattered: the entry is in /audit, the
+    chain around it needs /audit/verify, what the monitor thought is buried in
+    one entry's detail, and the delegation that led to it is spread across every
+    earlier entry sharing a mandate. Answering "what happened here, and can I
+    trust the answer" meant four calls and joining them by hand.
+
+    Read-only, and deliberately so. An incident view that can change anything is
+    a second way to move money, and this system already has one too many places
+    where authority could accidentally live.
+
+    It reports what it CANNOT establish as plainly as what it can. An audit tool
+    that quietly presents a broken chain as a clean history is worse than no
+    tool, because it converts an unanswered question into a false answer - the
+    same failure as an unconfigured monitor recording `allow`.
+    """
+    entries = state.audit.entries()
+    match = next((e for e in entries if e.seq == audit_seq), None)
+    if match is None:
+        raise HTTPException(404, f"no audit entry at seq {audit_seq}")
+
+    # Is the record itself trustworthy? Asked first, because every answer below
+    # is read out of this log and none of them mean anything if it was altered.
+    try:
+        state.audit.verify()
+        chain_ok, broken_at = True, None
+    except AuditTampered as exc:
+        chain_ok, broken_at = False, str(exc)
+
+    same_mandate = [e for e in entries if e.mandate_id == match.mandate_id]
+
+    def summarise(e) -> dict[str, Any]:
+        return {
+            "seq": e.seq,
+            "at": e.at.isoformat(),
+            "actor": e.actor,
+            "tool": e.tool,
+            "decision": e.decision.value,
+            "reason": e.reason,
+            "amount_paise": e.amount_paise,
+        }
+
+    detail = match.detail or {}
+    # Three states, not two. "The monitor was never consulted" and "the monitor
+    # allowed this" are different facts and must not be printed the same way.
+    verdict = detail.get("monitor")
+    judgement = {
+        "verdict": verdict or "not recorded",
+        "reason": detail.get("monitor_reason", ""),
+        "means": {
+            "allow": "a monitor read this and approved it",
+            "escalate": "a monitor objected and a person decided",
+            "defer": "a monitor asked for a smaller amount",
+            "skipped": "monitoring was switched off for this run",
+            "unconfigured": "no monitor existed; this was NOT reviewed",
+            "not-consulted": "held for another reason; no monitor judged it",
+        }.get(verdict, "no verdict was recorded against this payment"),
+    }
+
+    return {
+        "entry": summarise(match) | {"context": match.context, "detail": detail},
+        "mandate": {
+            "id": match.mandate_id,
+            "intent": state.intents.get(match.mandate_id, "not recorded"),
+            "ledger": _ledger_or_none(match.mandate_id),
+        },
+        # The chain of authority that reached this payment, in order.
+        "leading_to_it": [summarise(e) for e in same_mandate if e.seq < match.seq],
+        "after_it": [summarise(e) for e in same_mandate if e.seq > match.seq],
+        "judgement": judgement,
+        "record": {
+            "chain_intact": chain_ok,
+            "broken_at": broken_at,
+            "head": state.audit.head[:16],
+            "prev_hash": match.prev_hash[:16],
+            "proves": (
+                "no entry was altered or removed in place"
+                if chain_ok else "nothing - the chain is broken"
+            ),
+        },
+        "replayable": audit_seq in _REPLAYABLE,
+    }
+
+
+def _ledger_or_none(mandate_id: str) -> dict[str, Any] | None:
+    """The mandate's budget state, or None if it is no longer known.
+
+    A mandate can outlive the ledger's memory of it. Returning None says so
+    rather than reporting zeros, which would read as a mandate that spent
+    nothing.
+    """
+    try:
+        st = state.ledger.state(mandate_id)
+    except (UnknownMandate, LedgerError):
+        return None
+    return {
+        "cap_paise": st.cap_paise,
+        "committed_paise": st.committed_paise,
+    }
+
+
 @app.post("/replay/{audit_seq}")
 def replay_payment(audit_seq: int) -> dict[str, Any]:
     """Send a settled payment again, byte for byte.
