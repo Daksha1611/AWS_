@@ -49,6 +49,27 @@ const state = {
 const record = (event) =>
   seen.set(`${event.run_id ?? '-'}|${event.node_id}|${event.kind}|${event.at}`, event)
 
+// Which run this tab started, remembered across a reload and nowhere else.
+//
+// sessionStorage rather than localStorage on purpose: a demo that is reloaded
+// mid-run should come back, and a browser opened tomorrow should not resurrect
+// a mandate that has long since expired. Every accessor is wrapped because a
+// private window, a thumbnail capture or blocked site data makes these throw
+// rather than return empty.
+const OWN_RUN = 'pc.run'
+
+const rememberRun = (id, task) => {
+  try { sessionStorage.setItem(OWN_RUN, JSON.stringify({ id, task })) } catch { /* fine */ }
+}
+
+const ownRun = () => {
+  try { return JSON.parse(sessionStorage.getItem(OWN_RUN) || 'null') } catch { return null }
+}
+
+const forgetRun = () => {
+  try { sessionStorage.removeItem(OWN_RUN) } catch { /* fine */ }
+}
+
 const allEvents = () => {
   const all = [...seen.values()]
   if (!state.mandateId) return all
@@ -121,9 +142,22 @@ async function refresh() {
   state.approvals = approvals.pending ?? []
   state.audit = auditBody.entries ?? []
 
+  // Adopt only a run this browser actually started.
+  //
+  // This used to take the first `mandate` entry out of the audit log, which is
+  // shared by every visitor to the deployment - so opening the console attached
+  // you to a stranger's run and drew it as though it were yours. `.find()` also
+  // returns the OLDEST such entry, so it was not even the most recent one.
+  //
+  // The audit stays global and hash-linked, because a log anyone can verify is
+  // the point of it. What is per-visitor is which run the console is looking
+  // at, and that belongs in the browser rather than in the server's memory.
   if (!state.mandateId) {
-    const opened = (auditBody.entries ?? []).find((e) => e.tool === 'mandate')
-    if (opened) { state.mandateId = opened.mandate_id; state.task = opened.context || '' }
+    const mine = ownRun()
+    if (mine && (auditBody.entries ?? []).some((e) => e.mandate_id === mine.id)) {
+      state.mandateId = mine.id
+      state.task = mine.task || ''
+    }
   }
   if (state.mandateId) {
     state.mandate = await gw.mandate(state.mandateId).catch(() => state.mandate)
@@ -655,6 +689,7 @@ async function startRun(proposal) {
   seen.clear()
   state.mandateId = null
   state.mandate = null
+  forgetRun()
   state.task = proposal.task
   state.floor = proposal.floor_paise / 100
   intake.reset()
@@ -665,6 +700,7 @@ async function startRun(proposal) {
   try {
     const started = await gw.startProposal(proposal)
     state.mandateId = started.mandate_id
+    rememberRun(started.mandate_id, proposal.task)
     // Three states, not two: a layer that is watching, one someone switched
     // off, and one this deployment does not have. Collapsing the last two into
     // "off" was the smaller half of the same dishonesty as the monitor's.
