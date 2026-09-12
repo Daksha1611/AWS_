@@ -39,7 +39,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request as _Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import bedrock, config, counterparties, events, funnel as funnels
+from . import bedrock, cedar, config, counterparties, events, funnel as funnels
 from . import identity, intake, providers, token
 from . import memory as memory_bank
 from .approvals import AlreadyResolved, ApprovalStore, UnknownApproval
@@ -420,6 +420,16 @@ def _depth(bearer, claimed: int | None, *, mid: str, tool: str, context: str) ->
             detail={"claimed_depth": claimed, "derived_depth": derived},
         )
     return derived
+
+
+def _role(bearer) -> str:
+    """The principal's role, as the authorisation policy names it.
+
+    Derived from the token chain, never from the request body. A role the caller
+    could assert is not a role - it is a request, and this one decides whether
+    the money moves.
+    """
+    return "broker" if token.is_broker(bearer) else "payer"
 
 
 def _mount_console() -> None:
@@ -1162,16 +1172,22 @@ def pay(
     except token.Denied as exc:
         raise deny(str(exc), 403) from exc
 
-    # 4b. broker separation - policy, not cryptography.
+    # 4b. the rules we chose, as opposed to the ones we proved.
     #
-    # A broker must be able to confer `pay` on its sub-payers, and attenuation is
+    # Everything above this line is a cryptographic guarantee: the signature, the
+    # chain, the scope, the expiry, the depth. What follows is policy - decisions
+    # someone made about who may do what - and it lives in policies/pay.cedar so
+    # that it can be read without reading this function.
+    #
+    # The rule that used to be written here is the broker separation. A broker
+    # must be able to confer `pay` on its sub-payers, and attenuation is
     # monotonic, so its own chain necessarily permits `pay` too. The token cannot
-    # express "may grant but not spend", so the enforcement point does. Said
-    # plainly because the distinction matters: the per-seller caps below are a
-    # cryptographic guarantee; this line is a rule we chose to apply here.
-    if token.is_broker(bearer):
-        raise deny("a broker may delegate, not spend", 403,
-                   {"delegate": token.terminal_delegate(bearer)})
+    # express "may grant but not spend", so the enforcement point does.
+    refusal = cedar.decide(action="pay", role=_role(bearer), mandate_id=mid)
+    if refusal is not None:
+        raise deny(refusal.reason, refusal.status,
+                   {"policy": refusal.policy_id,
+                    "delegate": token.terminal_delegate(bearer)})
 
     # 5. reserve - cumulative spend and idempotency, in one lock
     #
@@ -1517,10 +1533,15 @@ def payout(request: Request, req: Annotated[PayoutRequest, Body()]) -> dict[str,
     except token.Denied as exc:
         raise deny("scope never granted: no block in this chain permits payout", 403) from exc
 
-    # Unreachable with any token this gateway mints, but written closed rather
-    # than left to fall through - a path that cannot happen today is exactly the
-    # path that happens after someone widens a scope next month.
-    raise deny("payout is not enabled on this deployment", 501)
+    # Unreachable with any token this gateway mints, because none carries
+    # `tool:payout` in scope and step 4 has just refused it. Kept, and moved into
+    # the policy file, because a path that cannot happen today is exactly the
+    # path that happens after someone widens a scope next month - and when that
+    # day comes, the switch should be somewhere a person would look.
+    refusal = cedar.decide(action="payout", role=_role(bearer), mandate_id=mid)
+    if refusal is not None:
+        raise deny(refusal.reason, refusal.status)
+    raise deny("payout reached the end of the money path without settling", 500)
 
 
 class ApprovalDecision(BaseModel):

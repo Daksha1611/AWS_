@@ -112,8 +112,6 @@ there too.
 
 ### D6 — Cedar for the policy layer at `/pay`
 
-*(in progress)*
-
 Step 4b of the money path already carried this comment: *"The token cannot
 express 'may grant but not spend', so the enforcement point does. Said plainly
 because the distinction matters: the per-seller caps below are a cryptographic
@@ -124,6 +122,34 @@ open-source, and it separates the two guarantees the code was already careful to
 distinguish — attenuation stays cryptographic in the token, and the rules we
 *chose* become readable, testable policy instead of `if` statements buried in a
 2000-line module.
+
+**The policy file is deliberately short, and that is the argument, not an
+apology.** Two forbid rules and a permit. The temptation was to move the scope
+and budget checks in as well and have an impressive-looking `.cedar` file, and
+that would have been wrong: a policy engine asked to re-confirm what a signature
+already settled is a second opinion on a fact, and a Cedar rule that agreed with
+the token would be decoration that could later drift out of agreement. So Cedar
+got exactly the part that was a decision:
+
+- `broker-may-not-spend` — was an `if` at line 1173.
+- `payout-is-not-enabled` — was an unreachable `raise` at the bottom of
+  `/payout`, described in its own comment as "written closed rather than left to
+  fall through". It is now a switch in the file a person would actually look in.
+
+**What stayed in Python.** The empty-context refusal. "Did the caller state a
+reason" is a question about whether the request is well-formed, not about
+whether this principal may act on this resource, and Cedar answers the second
+question only.
+
+**Fails closed**, unlike the monitor. The monitor is a second opinion and
+blocking every payment because it is unreachable would make the system worse
+than having no monitor. This is the only thing standing between a broker and the
+money, so an unanswerable policy question refuses with a 503.
+
+**Cost.** The enforcement path is timed and that number is quoted in the README,
+so the policy set is parsed once at import into a `PolicySet` handle and reused.
+Parsing is the dominant cost of an authorisation call; doing it per payment
+would have put a millisecond into the headline figure.
 
 ### D7 — DynamoDB replaces Firestore
 
@@ -178,10 +204,20 @@ code was technically all-rights-reserved. Added the Apache-2.0 text and a
 | `agent/buyer.py` | ported | Also dropped model probing: the old provider needed a live one-token call to find which model name answered that day. |
 | `agent/tools.py` | `finish()` lost `tool_context` | It existed only to set an escalation flag that broke out of ADK's loop. The loop is ordinary Python now and reads `tools.finished` — so an agent can no longer end an errand in a way no test could observe. |
 
+### The policy layer
+
+| File | Change | Why |
+|---|---|---|
+| `policies/pay.cedar` | new | The authorisation policy, readable in under a minute. |
+| `pocketchange/cedar.py` | new | Loads and evaluates it; maps a decision back to the message and status the gateway answers with. Parsed once at import. |
+| `pocketchange/gateway.py` | two `if`s removed | Broker separation and the payout switch now come from the policy file. A new `_role()` derives the principal's role from the token chain — never from the request body, since a role the caller can assert is not a role. |
+
 ### Tests
 
 | File | Change | Why |
 |---|---|---|
+| `tests/test_cedar.py` | new | Each rule end to end, plus fail-closed and hostile entity ids. Cedar identifies policies positionally, so the annotation mapping is the fragile part and is tested through the round trip rather than directly. |
+| `tests/test_gateway.py` | **flake fixed** | `test_replay_...does_not_charge_twice` failed about one run in four, and had before this port. `/replay` reports `charged_twice` by comparing the mandate's *whole* committed total, while the run that produced the payment is still settling siblings — so a concurrent settlement was indistinguishable from a double charge. The test now waits for the ledger to go quiet. See §5: the endpoint is still imprecise. |
 | `tests/conftest.py` | hardened | **The trap of the port.** Clearing `AWS_*` does not take a process offline — boto3 also reads `~/.aws/config`, an SSO cache and instance metadata. On any machine where `aws configure` had been run, the suite quietly went back on the network. `POCKETCHANGE_NO_BEDROCK` is checked before boto3 is consulted at all. |
 | `tests/test_bedrock.py` | new | Availability, region precedence, and the model-spreading reversal. |
 | `tests/test_llm.py` | rewritten | Stubs one function instead of installing a fake module tree into `sys.modules` — itself an argument for keeping the model boundary narrow. |
@@ -211,3 +247,11 @@ wholesale, and the part that enforces the limits did not move.
 - Bedrock has not been called against real credentials from this machine; the
   offline paths and the test suite are what have been exercised so far.
 - Region/model-id pairs need one live check before the demo — see D4.
+- `/replay` reports `charged_twice` by diffing the mandate's whole committed
+  total, so it cannot distinguish "this replay charged again" from "something
+  else settled while I was looking". The test now avoids the race; the endpoint
+  still has it. The honest fix is to measure the delta attributable to the
+  replayed idempotency key, not the mandate.
+- The Cedar principal's entity id is currently the role string, because the two
+  rules only read `principal.role`. A rule that needed to name an individual
+  agent would want the delegate id there instead.
