@@ -267,6 +267,20 @@ code was technically all-rights-reserved. Added the Apache-2.0 text and a
 
 ---
 
+### Deployment artefacts
+
+| File | Change | Why |
+|---|---|---|
+| `deploy/cloudrun.sh`, `deploy/cloudbuild.yaml` | deleted | Replaced, not ported. |
+| `deploy/docker-compose.yml` | new | DynamoDB Local — the entire infrastructure for running this on a laptop. Carries a long comment about the failure it took an hour to diagnose: the container runs as uid 1000, a named volume is created root-owned, and the result is a container that starts, prints its configuration, **passes a TCP health check**, accepts connections and then never answers a request, while the real error repeats in a log nobody is tailing. From the client it looks like an unexplained read timeout against a healthy container. |
+| `deploy/template.yaml` | new | The stack as a SAM template. **Never deployed, never validated** — `sam validate` has not been run and there is no SAM CLI on the machine. It says so at the top. `bedrock:InvokeModel` is scoped to the two model ids rather than `*`, because a wildcard in a project arguing for bounded authority would be funny in the wrong way. |
+| `deploy/README.md` | new | What running it actually takes, and the four things that are correct for a laptop and wrong for a service. |
+| `pocketchange/lambda_handler.py` | new | Twelve lines, the only code that knows it might be in Lambda. |
+| `Dockerfile` | fixed | **Now copies `policies/`.** Cedar fails closed, so an image built without that line answers 503 to every payment. |
+| `.env.example` | rewritten | There is no model API key in it any more, and that absence is the point. |
+
+---
+
 ## 4. What deliberately did not change
 
 - `pocketchange/token.py` — attenuation, signing, verification. Untouched.
@@ -282,9 +296,17 @@ wholesale, and the part that enforces the limits did not move.
 
 ## 5. Open
 
-- Bedrock has not been called against real credentials from this machine; the
-  offline paths and the test suite are what have been exercised so far.
-- Region/model-id pairs need one live check before the demo — see D4.
+- **Bedrock has never been called.** No AWS credentials have been used from this
+  machine, so every Bedrock path is exercised only by its tests and its offline
+  branch. This is the largest untested surface in the port and the first thing
+  to check before a demo: `aws configure`, then
+  `python -c "from pocketchange import config; print(config.report())"` should
+  say `bedrock:yes`, and a `/runs` with `decomposer=model` should work.
+- Region/model-id pairs need that same live check — see D4.
+- DynamoDB, by contrast, **has** been run for real: `scripts/smoke_dynamodb.py`
+  passes 9/9 against DynamoDB Local in the compose file, so the condition
+  expressions and transactions are known to be ones the actual service accepts
+  rather than only ones moto tolerates.
 - `/replay` reports `charged_twice` by diffing the mandate's whole committed
   total, so it cannot distinguish "this replay charged again" from "something
   else settled while I was looking". The test now avoids the race; the endpoint

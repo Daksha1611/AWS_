@@ -26,6 +26,8 @@ biscuit = ["biscuit-python"]
 agent = ["anthropic[bedrock]", "strands-agents", "strands-agents-tools"]
 # Cedar, for the authorisation policy evaluated at the /pay enforcement point.
 policy = ["cedarpy"]
+# Only needed to run the gateway behind API Gateway. See deploy/template.yaml.
+lambda = ["mangum"]
 trace = ["langfuse", "opentelemetry-exporter-otlp-proto-http"]
 # moto mocks DynamoDB in-process, so the storage backends are held to the same
 # assertions as the in-memory ones without an AWS account or a container.

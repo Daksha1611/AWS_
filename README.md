@@ -6,23 +6,19 @@
 
 **You hand an agent pocket change, not your wallet.**
 
-[![tests](https://img.shields.io/badge/tests-378_passing-2f6b45)](#verify-every-claim-on-this-page)
+[![tests](https://img.shields.io/badge/tests-528_passing-2f6b45)](#verify-every-claim-on-this-page)
 [![offline](https://img.shields.io/badge/offline-no_credentials_needed-4a5a51)](#60-second-start)
 [![enforcement](https://img.shields.io/badge/enforcement-0.18_ms-2f6b45)](#what-it-costs)
 [![SoK](https://img.shields.io/badge/SoK_vectors-10%2F12_defended-2f6b45)](#the-threat-model)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-4a5a51)](#licence)
 
-### **[▶ Live demo](https://pocket-change-590042703212.asia-south1.run.app)**
+<sub>A working prototype, not production software. It runs **locally** — see
+[60-second start](#60-second-start). Payments are real API calls on Razorpay
+**test** mode; the code refuses live keys outright. Every number below is
+measured by a command in this repository, and the [Limitations](#limitations)
+section is not a formality.</sub>
 
-*Reads are open — no token needed to browse the tree, ledger, audit trail
-and counterparty record.*
-
-<sub>A working prototype, not production software. Payments are real API calls
-on Razorpay **test** mode; the code refuses live keys outright. Every number
-below is measured by a command in this repository, and the
-[Limitations](#limitations) section is not a formality.</sub>
-
-*Razorpay test-mode payments · Gemini · Google Cloud Firestore · Biscuit capability tokens*
+*Amazon Bedrock · Strands Agents SDK · Cedar · Amazon DynamoDB · Biscuit capability tokens · Razorpay test-mode payments*
 
 <img src="assets/landing.png" alt="Pocket Change — the agent is assumed compromised" width="880">
 
@@ -55,12 +51,13 @@ That is the premise, not a caveat.
 
 ## 60-second start
 
-No credentials, no network, no quota. Everything below runs on a clean clone.
+No AWS account, no credentials, no network, no card. Everything below runs on a
+clean clone.
 
 ```bash
-python3.12 -m venv .venv && .venv/bin/pip install -e ".[biscuit,gcp,agent,trace,dev]"
+python3.12 -m venv .venv && .venv/bin/pip install -e ".[biscuit,agent,policy,dev]"
 
-.venv/bin/pytest                              # 399 tests, ~6s
+.venv/bin/pytest                              # 528 tests, ~30s
 .venv/bin/python scripts/demo_funnel.py       # 148 agents, 81 payments, one ceiling
 .venv/bin/python scripts/demo_injection.py    # a fully compromised agent, refused
 .venv/bin/python scripts/demo_trust.py        # the seller's reputation vs ours
@@ -71,12 +68,25 @@ python3.12 -m venv .venv && .venv/bin/pip install -e ".[biscuit,gcp,agent,trace,
 procurement task into 148 agents across 5 layers, pays 81 of them, and proves
 they could not collectively exceed one ceiling.
 
-Then the live version, which needs keys in `.env`:
+Then the live version:
 
 ```bash
-.venv/bin/pocketchange serve                  # gateway; check it says rail: razorpay-test
+.venv/bin/pocketchange serve                  # gateway
 cd frontend && npm install && npm run dev     # the console
 ```
+
+Durable storage needs no AWS account either — DynamoDB Local is a container:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d
+export POCKETCHANGE_DDB_ENDPOINT=http://localhost:8000
+.venv/bin/python scripts/smoke_dynamodb.py    # 9 gates against a real DynamoDB
+```
+
+A model *does* need credentials. `aws configure` with a principal allowed to
+call `bedrock:InvokeModel`, and the monitor, the critic and the model-backed
+decomposer come alive. Without it they do not silently degrade into something
+that looks the same — see [When the model is not there](#when-the-model-is-not-there).
 
 The console asks for one sentence. It reads the request back, then asks only for
 what it could not work out — and it is **never allowed to infer the ceiling**.
@@ -90,33 +100,20 @@ deterministic, nothing judges a payment, no critic reads a plan and orders are
 simulated — each of those is the right way to fail, and the console says so
 rather than rendering a degraded run and a full one identically.
 
-### Deploy it
+### Deploying it
 
-One Cloud Run service serves both the API and the console, so there is one URL
-and **no CORS to configure** — the console fetches same-origin paths.
+**It is not deployed, and this section is not going to imply otherwise.**
 
-It deploys with `--no-cpu-throttling --min-instances=1`, and that is not a
-performance tweak. The funnel runs on a background thread *after* `POST /runs`
-has already answered, and Cloud Run only guarantees CPU while a request is in
-flight — so by default it saw an idle instance and shut it down **mid-run**. The
-tree simply stopped growing at whatever node it had reached, with no error
-anywhere. Those two flags are what make a fire-and-watch API viable on
-serverless.
+`deploy/template.yaml` describes the stack — the DynamoDB table, the function
+behind an HTTP API, and `bedrock:InvokeModel` scoped to exactly the two model
+ids this project calls rather than to `*`. It has never been applied.
 
-```bash
-./deploy/cloudrun.sh          # enables APIs, stores secrets, builds, deploys
-```
-
-Idempotent, prints the URL and the demo token, and never prints a key. Cloud
-Build does the image build, so no local Docker daemon is needed.
-
-**Reads are public; writes are gated.** Anyone can browse the tree, the ledger,
-the audit trail and the counterparty record without presenting anything.
-Starting a run needs a demo token, which the deployed console already carries.
-That is a brake on a shared free tier — 15 model requests a minute — not
-authentication: the token ships inside a public page and anyone who opens
-devtools has it. Runs are additionally capped at 8 per 10 minutes per instance.
-Credentials live in Secret Manager, never in environment variables or the image.
+`deploy/README.md` is the honest version: what you would have to supply, and the
+four things in the code that are correct for a laptop and wrong for a service.
+The largest is that the root signing key is generated per instance, so on a
+serverless platform every cold start would silently revoke every live mandate.
+That belongs in KMS, and saying so is more useful than a deploy button that
+works once.
 
 📐 **Architecture, in six diagrams**
 
