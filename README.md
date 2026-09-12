@@ -697,5 +697,8 @@ work this design borrows from are recorded in [`NOTICE`](NOTICE).
 This project was originally built against a different cloud. Every file the move
 touched — and, more usefully, every decision that looks arbitrary until you know
 what was tried first — is written down in [`PORTING.md`](PORTING.md), including
-the two things the port got wrong before it got them right and the latent bug it
+the things the port got wrong before it got them right and the latent bug it
 uncovered on the way.
+
+[`HACKATHON.md`](HACKATHON.md) is the short version: which AWS open source does
+what, what we learned, and the known gaps stated up front.
