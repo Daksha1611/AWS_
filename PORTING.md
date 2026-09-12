@@ -315,3 +315,16 @@ wholesale, and the part that enforces the limits did not move.
 - The Cedar principal's entity id is currently the role string, because the two
   rules only read `principal.role`. A rule that needed to name an individual
   agent would want the delegate id there instead.
+- **A second flake, not chased.** `test_t2t_a_fabricated_price_cannot_enter_a_cart`
+  failed once in roughly five full runs with `KeyError: 'token'`, which means
+  its `surface` fixture's `POST /delegate` came back without one. It passes in
+  isolation and it predates this port — nothing here touches `/delegate`. The
+  likely shape is the same as the replay flake that *was* fixed: a background
+  run from an earlier test still working against the module-global
+  `gateway.state` that the next test has already replaced. Worth an hour
+  sometime; the fix is probably for the gateway tests to join their background
+  threads rather than for this test to retry.
+- `scripts/demo_standing.py` needs a real model and fails without credentials.
+  That is true of the pre-port code too - it is a demo *of* the model-backed
+  standing-order path - but it is the one demo the README does not flag as
+  runnable offline, and it should.

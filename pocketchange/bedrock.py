@@ -104,9 +104,21 @@ def client(timeout: float = TIMEOUT_SECONDS):
     still climbing, which is why every caller passes one.
     """
     if not available():
+        # Say which of the two it is. The first draft of this message suggested
+        # setting POCKETCHANGE_NO_BEDROCK to "work offline", which is exactly
+        # backwards - that switch is what forces this failure - and it was read
+        # by someone who had already set it.
+        if os.environ.get("POCKETCHANGE_NO_BEDROCK"):
+            raise BedrockUnavailable(
+                "POCKETCHANGE_NO_BEDROCK is set, so no model is reachable in "
+                "this process. Callers that can run without judgement check "
+                "`bedrock.available()` first; this one needs a model. Unset it "
+                "and run `aws configure`."
+            )
         raise BedrockUnavailable(
             f"no AWS credentials resolved for region {region()}. "
-            "Run `aws configure`, or set POCKETCHANGE_NO_BEDROCK=1 to work offline."
+            "Run `aws configure`, or give this process a role that can call "
+            "bedrock:InvokeModel."
         )
     from anthropic import AnthropicBedrockMantle
 

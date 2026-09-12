@@ -48,17 +48,36 @@ def rupees(paise):
 
 
 def scripted(node):
-    """Stands in for a model. One call per branch node; 40 for this whole tree."""
+    """Stands in for a model. One call per branch node; 40 for this whole tree.
+
+    Sourcing is stated at every level, and it has to be. A sub-task may only
+    *narrow* its parent's sourcing - the same rule the tokens follow, on the
+    other axis of authority - so a tree rooted at `catalogue` cannot contain a
+    node that reads the open web no matter what a decomposer asks for.
+
+    This demo wants exactly one leaf out on the web, so the root opens at BEST
+    and every branch except the first narrows to CATALOGUE on the way down. Left
+    to inherit, all 81 leaves would be web-sourced, which would make the point
+    about the looker by drowning it.
+    """
     share = node.budget_paise // 3
+    first = funnel.BEST
+    rest = funnel.CATALOGUE
     if node.depth == 0:
-        return [funnel.SubTask(f"kit out {d}", share) for d in DEPARTMENTS]
+        return [funnel.SubTask(f"kit out {d}", share,
+                               sourcing=first if d == DEPARTMENTS[0] else rest)
+                for d in DEPARTMENTS]
     if node.depth == 1:
-        return [funnel.SubTask(f"{node.description}: {c}", share) for c in CATEGORIES]
+        return [funnel.SubTask(f"{node.description}: {c}", share,
+                               sourcing=first if c == CATEGORIES[0] else rest)
+                for c in CATEGORIES]
     if node.depth == 2:
         return [funnel.SubTask(f"{node.description} - {i}", share,
-                               sourcing=funnel.BEST if i == ITEMS[0] else funnel.CATALOGUE)
+                               sourcing=first if i == ITEMS[0] else rest)
                 for i in ITEMS]
-    return [funnel.SubTask(f"{node.description} lot {i}", share) for i in (1, 2, 3)]
+    return [funnel.SubTask(f"{node.description} lot {i}", share,
+                           sourcing=first if i == 1 else rest)
+            for i in (1, 2, 3)]
 
 
 def main():
@@ -101,6 +120,11 @@ def main():
         budget_paise=BUDGET, bus=bus,
         bounds=funnel.Bounds(max_depth=8, max_fanout=6, max_nodes=200,
                              decompose_floor_paise=FLOOR),
+        # The root opens at BEST so the tree is *allowed* to reach the open web.
+        # Without this the funnel clamps every sub-task back to `catalogue` -
+        # correctly, since sourcing may only narrow - and the looker this demo
+        # exists to show is never built.
+        sourcing=funnel.BEST,
         search=look,
     )
 
@@ -166,7 +190,17 @@ def main():
     if hostile:
         print(f"\n  a page the searcher read, unmarked for display:")
         print(f"    {unmark(hostile[0].body_untrusted)[:150]}...")
-    looker = next(n for n in result.root.walk() if n.is_helper)
+    looker = next((n for n in result.root.walk() if n.is_helper), None)
+    if looker is None:
+        # Loud rather than a bare StopIteration traceback. This demo crashed
+        # here for a while because the root was left at `catalogue`, so every
+        # BEST sub-task was clamped on the way down and no looker was ever
+        # built - a correct funnel refusing an impossible request, surfacing as
+        # an unhandled exception three sections later.
+        print("\n  no looker in this tree: nothing was sourced from the web.")
+        print("  the funnel narrows sourcing and never widens it, so a root at")
+        print("  'catalogue' cannot contain a node that reads the open web.")
+        return 1
     print(f"\n  the agent that read it holds  Rs 0.00 and tools ['search'], and is a")
     print(f"  SIBLING of the payer, not its child - a child would force the payer")
     print(f"  to hold 'search' for the child to inherit it.")
