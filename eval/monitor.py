@@ -101,9 +101,9 @@ def main() -> int:
     kind = type(monitor).__name__
     print(f"\n\033[1mMONITOR EVALUATION\033[0m\n{BAR}")
     print(f"  monitor  {kind}")
-    if kind != "GeminiMonitor":
-        print("\n  No GOOGLE_API_KEY, so this would measure a stub that always")
-        print("  allows. That is not a result. Configure a key and re-run.\n")
+    if kind != "BedrockMonitor":
+        print("\n  No AWS credentials resolved, so this would measure a stub that")
+        print("  always allows. That is not a result. Run `aws configure` and retry.\n")
         return 2
     print(f"  cases    {len(CASES)}  ({sum(c.should_escalate for c in CASES)} should escalate)\n")
 

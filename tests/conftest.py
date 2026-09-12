@@ -34,13 +34,27 @@ def never_read_dotenv():
 
 @pytest.fixture(autouse=True)
 def no_cloud(monkeypatch):
-    """No credentials in tests, so nothing reaches Firestore, Razorpay or Gemini."""
+    """No credentials in tests, so nothing reaches DynamoDB, Razorpay or Bedrock.
+
+    Clearing the environment is NOT sufficient for AWS and this is the trap the
+    port walked into. boto3 resolves credentials from a chain - `~/.aws/config`,
+    an SSO cache, instance metadata - none of which is an environment variable,
+    so on any developer machine with `aws configure` already run,
+    `bedrock.available()` kept answering True with an empty environment and the
+    suite quietly went back on the network.
+
+    POCKETCHANGE_NO_BEDROCK is the switch that actually closes it, checked
+    before boto3 is consulted at all.
+    """
+    monkeypatch.setenv("POCKETCHANGE_NO_BEDROCK", "1")
+    monkeypatch.setenv("POCKETCHANGE_NO_DYNAMODB", "1")
     for name in (
-        "GOOGLE_CLOUD_PROJECT",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
         "RAZORPAY_KEY_ID",
         "RAZORPAY_KEY_SECRET",
-        "GOOGLE_API_KEY",
-        "GEMINI_API_KEY",
         # The fallback providers. Omitting these was not hypothetical: adding the
         # fallback chain immediately turned two "the model is unreachable" tests
         # into live calls to Groq, which passed for the wrong reason and put the

@@ -8,18 +8,16 @@ a model felt optimistic.
 
 from __future__ import annotations
 
-from google.adk.agents import LlmAgent
-
-from agent.models import resilient
 from agent.prompts import REVIEWER_INSTRUCTION
+from agent.runtime import build_agent
 from agent.tools import ToolSurface
 
 
-def reviewer_node(tools: ToolSurface, model_name: str) -> LlmAgent:
-    return LlmAgent(
+def reviewer_node(tools: ToolSurface, model_id: str):
+    return build_agent(
         name="reviewer",
-        model=resilient(model_name),
         description="Decides whether the errand is finished or should re-plan.",
         instruction=REVIEWER_INSTRUCTION,
-        tools=tools.reviewer_functions(),
+        model_id=model_id,
+        functions=tools.reviewer_functions(),
     )

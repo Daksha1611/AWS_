@@ -13,13 +13,20 @@ dependencies = [
   "pyjwt",
   "httpx",
   "pydantic",
+  # boto3 is not optional: the ledger, the counterparty book and the model all
+  # reach AWS through it, and `bedrock.available()` is consulted on a health
+  # check that must answer whether or not the extras are installed.
+  "boto3",
 ]
 
 [project.optional-dependencies]
 biscuit = ["biscuit-python"]
-gcp = ["google-cloud-firestore"]
-agent = ["google-adk", "google-genai"]
-trace = ["langfuse", "openinference-instrumentation-google-adk"]
+# The model boundary. `anthropic[bedrock]` supplies the Messages-API client and
+# schema-enforced structured output; strands-agents is the agent runtime.
+agent = ["anthropic[bedrock]", "strands-agents", "strands-agents-tools"]
+# Cedar, for the authorisation policy evaluated at the /pay enforcement point.
+policy = ["cedarpy"]
+trace = ["langfuse", "opentelemetry-exporter-otlp-proto-http"]
 dev = ["pytest", "pytest-asyncio", "ruff"]
 
 [project.scripts]

@@ -601,20 +601,22 @@ class ToolSurface:
         self.cart.clear()
         return {"cart": {}, "total_paise": 0}
 
-    def finish(self, decision: str, note: str, tool_context=None) -> dict[str, Any]:
+    def finish(self, decision: str, note: str) -> dict[str, Any]:
         """End the errand. decision is 'done', 'give_up', or 'continue'.
 
         'done' and 'give_up' stop the loop. 'continue' lets it run again, which is
         how a re-plan happens: the reviewer declines to finish and the next
         iteration shops against the refusal.
+
+        This used to take a framework-supplied `tool_context` and set an
+        escalation flag on it, because that was the only way to break out of the
+        agent framework's loop early. The loop is ordinary Python now and reads
+        `finished` directly, so the argument is gone - and with it the chance of
+        an agent stopping the errand in a way no test could observe.
         """
         self.outcome = f"{decision}: {note}"
         if decision in ("done", "give_up"):
             self.finished = True
-            if tool_context is not None:
-                # ADK exits a LoopAgent when a sub-agent escalates. This is the
-                # agent choosing to stop, as distinct from hitting max_iterations.
-                tool_context.actions.escalate = True
         return {"decision": decision, "note": note, "stopped": self.finished}
 
     def snapshot(self) -> dict[str, Any]:

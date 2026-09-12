@@ -40,7 +40,7 @@ async function loadFacts() {
   const l = facts.live || {};
   const parts = [
     facts.rail === 'razorpay-test' ? 'razorpay test rail' : 'simulated rail',
-    `${facts.models?.primary === 'vertex' ? 'vertex' : 'ai studio'}` +
+    `${facts.models?.primary === 'bedrock' ? `bedrock ${facts.models?.region ?? ''}`.trim() : 'no model'}` +
       (facts.models?.fallbacks?.length ? ` + ${facts.models.fallbacks.length} fallbacks` : ''),
     facts.verdicts?.length === 3 ? 'all three verdicts' : `${facts.verdicts?.length ?? 0} verdicts`,
   ];

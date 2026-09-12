@@ -1,4 +1,4 @@
-"""The untrusted buyer agent: ADK + Gemini.
+"""The untrusted buyer agent: Strands on Bedrock.
 
 Two agents, not one, and they are siblings rather than a chain.
 
@@ -17,8 +17,8 @@ an attacker can talk to. Siblings are the only safe shape - the same
 control/data separation CaMeL enforces in a custom interpreter, here falling out
 of the token chain.
 
-The model is assumed compromised throughout. Nothing below depends on Gemini
-behaving well; it depends on Gemini being unable to widen a token.
+The model is assumed compromised throughout. Nothing below depends on the model
+behaving well; it depends on the model being unable to widen a token.
 """
 
 from __future__ import annotations
@@ -27,20 +27,21 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from google.adk.agents import LlmAgent
-from google.adk.runners import InMemoryRunner
-from google.genai import types
-
+from .runtime import build_agent, said
 from .tools import ToolSurface
 
+
 def default_model() -> str:
-    """Resolved lazily - probing costs a request, so only do it when needed."""
-    from pocketchange import config
+    """The buyer's model id.
 
-    return config.resolve_model(config.BUYER_MODELS, override_env="POCKETCHANGE_MODEL")
+    No probing. The previous provider needed a live one-token request to find
+    out which of several model names actually answered, because the free tier
+    served different ones on different days. Bedrock either serves the id or
+    returns an error naming it, so asking first bought nothing but latency.
+    """
+    from pocketchange import bedrock
 
-
-DEFAULT_MODEL = None  # resolved at call time by default_model()
+    return os.getenv("POCKETCHANGE_MODEL", "").strip() or bedrock.WORK_MODEL
 
 SHOPPER_INSTRUCTION = """\
 You are a grocery shopper for a household in India. Prices are in paise; 100
@@ -91,25 +92,26 @@ class BuyerRun:
         return sum(a.allowed for a in self.tools.attempted("checkout"))
 
 
-def build_shopper(tools: ToolSurface, model: str | None = None) -> LlmAgent:
+def build_shopper(tools: ToolSurface, model: str | None = None):
     """Reads untrusted text. Holds no payment capability."""
-    return LlmAgent(
+    return build_agent(
         name="shopper",
-        model=model or default_model(),
         description="Finds groceries and assembles a cart.",
         instruction=SHOPPER_INSTRUCTION,
-        tools=[tools.search_products, tools.add_to_cart, tools.view_cart, tools.payout],
+        model_id=model or default_model(),
+        functions=[tools.search_products, tools.add_to_cart,
+                   tools.view_cart, tools.payout],
     )
 
 
-def build_payer(tools: ToolSurface, model: str | None = None) -> LlmAgent:
+def build_payer(tools: ToolSurface, model: str | None = None):
     """Spends. Never sees a product description."""
-    return LlmAgent(
+    return build_agent(
         name="payer",
-        model=model or default_model(),
         description="Settles an assembled cart.",
         instruction=PAYER_INSTRUCTION,
-        tools=[tools.view_cart, tools.checkout],
+        model_id=model or default_model(),
+        functions=[tools.view_cart, tools.checkout],
     )
 
 
@@ -134,18 +136,9 @@ async def run_single_agent(
         (build_shopper(tools, model), request),
         (build_payer(tools, model), "Settle the cart that has been assembled."),
     ):
-        runner = InMemoryRunner(agent=agent, app_name="pocketchange")
-        session = await runner.session_service.create_session(
-            app_name="pocketchange", user_id="buyer"
-        )
-        message = types.Content(role="user", parts=[types.Part(text=prompt)])
-        async for event in runner.run_async(
-            user_id="buyer", session_id=session.id, new_message=message
-        ):
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if getattr(part, "text", None):
-                        transcript.append(f"[{agent.name}] {part.text.strip()}")
+        text = said(await agent.invoke_async(prompt))
+        if text:
+            transcript.append(f"[{agent.name}] {text}")
 
     return BuyerRun(transcript=transcript, tools=tools)
 

@@ -39,7 +39,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request as _Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import config, counterparties, events, funnel as funnels, identity, intake, providers, token
+from . import bedrock, config, counterparties, events, funnel as funnels
+from . import identity, intake, providers, token
 from . import memory as memory_bank
 from .approvals import AlreadyResolved, ApprovalStore, UnknownApproval
 from .audit import AuditLog, AuditTampered, Decision
@@ -539,17 +540,17 @@ def _choose_decomposer(req: RunRequest, bounds: funnels.Bounds):
     not.
     """
     wanted = req.decomposer
-    have_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"))
+    have_key = have_model()
 
     if wanted == "departmental" or (wanted == "auto" and not have_key):
         return _departmental(req.fan_out), "departmental (deterministic, no model)"
 
     if wanted == "model" and not have_key:
-        raise HTTPException(400, "decomposer=model needs GOOGLE_API_KEY or GEMINI_API_KEY")
+        raise HTTPException(400, "decomposer=model needs AWS credentials for Bedrock")
 
     from agent.nodes.decompose_node import make_decomposer
 
-    return make_decomposer(bounds), "model (gemini, one call per branch)"
+    return make_decomposer(bounds), "model (bedrock, one call per branch)"
 
 
 def _expected_model_calls(req: RunRequest, using_model: bool) -> int:
@@ -605,9 +606,7 @@ def _extractor():
     question instead of only the missing ones, which is a worse front door and a
     working one.
     """
-    have_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-                    or os.environ.get("GOOGLE_CLOUD_PROJECT"))
-    if not have_key:
+    if not have_model():
         return None
     try:
         from agent.nodes.intake_node import intake_chain
@@ -636,8 +635,7 @@ def read_request(req: IntakeRequest) -> dict[str, Any]:
         # Say what the run will cost before it is started, not after. The same
         # figure /runs returns, computed from the same function.
         proposal = RunRequest(**reading.proposal)
-        have_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"))
-        using_model = proposal.decomposer != "departmental" and have_key
+        using_model = proposal.decomposer != "departmental" and have_model()
         payload["expected_model_calls"] = _expected_model_calls(
             proposal, using_model=using_model)
         payload["model_calls_exact"] = not using_model
@@ -745,9 +743,9 @@ def start_run(req: RunRequest) -> dict[str, Any]:
         # is a layer that does not exist in this deployment. Reporting either as
         # a plain false let the console print "critic on" over a run no critic
         # ever read, and a ticked monitor box over payments nothing judged.
-        "critic": ("gemini" if critic
+        "critic": ("bedrock" if critic
                    else "off" if not req.critic else "unconfigured"),
-        "monitor": ("gemini" if (req.monitor and monitor_judges(state.monitor))
+        "monitor": ("bedrock" if (req.monitor and monitor_judges(state.monitor))
                     else "off" if not req.monitor else "unconfigured"),
         "capabilities": capabilities(),
         "expected_model_calls": _expected_model_calls(
@@ -765,9 +763,7 @@ def _make_critic(req: "RunRequest"):
     second opinion, and a run must never fail to start because one is
     unavailable.
     """
-    have_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-                    or os.environ.get("GOOGLE_CLOUD_PROJECT"))
-    if not have_key:
+    if not have_model():
         return None
     try:
         from agent.nodes.critic_node import make_critic
@@ -910,16 +906,20 @@ def publish_event(req: EventIn) -> dict[str, Any]:
     return {"published": True, "at": event.at.isoformat()}
 
 
-# Two paths, one handler. Google's edge intercepts /healthz on Cloud Run and
-# answers it with its own 404 before the request reaches the container - the
-# giveaway is a response carrying neither `server: Google Frontend` nor a trace
-# header, unlike every route that does arrive. /status is the one to use on a
-# deployment; /healthz stays for local runs and anything expecting that name.
+# Two paths, one handler. A managed edge may intercept /healthz and answer it
+# with its own 404 before the request reaches the container - the giveaway is a
+# response carrying no trace header, unlike every route that does arrive.
+# /status is the one to use on a deployment; /healthz stays for local runs and
+# anything expecting that name.
 def have_model() -> bool:
-    """Is there any model this process can actually reach?"""
-    return bool(os.environ.get("GOOGLE_API_KEY")
-                or os.environ.get("GEMINI_API_KEY")
-                or os.environ.get("GOOGLE_CLOUD_PROJECT"))
+    """Is there any model this process can actually reach?
+
+    One definition, called from five places that each used to inline their own
+    environment check. They drifted: two looked for a project id and two did
+    not, so the same process could report a model on /status and refuse to use
+    one on /runs.
+    """
+    return bedrock.available()
 
 
 def capabilities() -> dict[str, Any]:
@@ -943,8 +943,8 @@ def capabilities() -> dict[str, Any]:
         "payments_are_real": False,          # test mode, always. Never live keys.
         "model": model,
         "decomposer": "model" if model else "departmental",
-        "monitor": "gemini" if monitor_judges(state.monitor) else "unconfigured",
-        "critic": "gemini" if model else "unconfigured",
+        "monitor": "bedrock" if monitor_judges(state.monitor) else "unconfigured",
+        "critic": "bedrock" if model else "unconfigured",
         "search": bool(os.environ.get("TAVILY_API_KEY")),
         # One sentence a console can print without having to reason about the
         # combination itself.
@@ -1861,7 +1861,8 @@ def facts() -> dict[str, Any]:
         "verdicts": [v.value for v in Verdict],
         "rail": "razorpay-test" if not isinstance(state.rail, FakeRail) else "fake",
         "models": {
-            "primary": "vertex" if providers.vertex_available() else "aistudio",
+            "primary": "bedrock" if bedrock.available() else "none",
+            "region": bedrock.region(),
             "fallbacks": [p.name for p in providers.configured()],
         },
         "live": live,

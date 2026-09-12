@@ -9,18 +9,16 @@ Never reads a listing. It sees totals, item counts and rationales.
 
 from __future__ import annotations
 
-from google.adk.agents import LlmAgent
-
-from agent.models import resilient
 from agent.prompts import CHOOSER_INSTRUCTION
+from agent.runtime import build_agent
 from agent.tools import ToolSurface
 
 
-def chooser_node(tools: ToolSurface, model_name: str) -> LlmAgent:
-    return LlmAgent(
+def chooser_node(tools: ToolSurface, model_id: str):
+    return build_agent(
         name="chooser",
-        model=resilient(model_name),
         description="Compares competing carts against the budget and adopts one.",
         instruction=CHOOSER_INSTRUCTION,
-        tools=tools.chooser_functions(),
+        model_id=model_id,
+        functions=tools.chooser_functions(),
     )

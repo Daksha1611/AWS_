@@ -7,18 +7,16 @@ listing and act on it even if it wanted to.
 
 from __future__ import annotations
 
-from google.adk.agents import LlmAgent
-
-from agent.models import resilient
 from agent.prompts import PAYER_INSTRUCTION
+from agent.runtime import build_agent
 from agent.tools import ToolSurface
 
 
-def payer_node(tools: ToolSurface, model_name: str) -> LlmAgent:
-    return LlmAgent(
+def payer_node(tools: ToolSurface, model_id: str):
+    return build_agent(
         name="payer",
-        model=resilient(model_name),
         description="Settles the adopted cart.",
         instruction=PAYER_INSTRUCTION,
-        tools=tools.payer_functions(),
+        model_id=model_id,
+        functions=tools.payer_functions(),
     )
