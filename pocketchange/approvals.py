@@ -112,7 +112,7 @@ class PendingApproval:
 
 
 class ApprovalStore:
-    """In-process, and shaped like ledger.Ledger so Firestore can replace it."""
+    """In-process, and shaped like ledger.Ledger so DynamoDB can replace it."""
 
     def __init__(self, ttl: timedelta = DEFAULT_TTL) -> None:
         self._ttl = ttl

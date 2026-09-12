@@ -27,7 +27,9 @@ agent = ["anthropic[bedrock]", "strands-agents", "strands-agents-tools"]
 # Cedar, for the authorisation policy evaluated at the /pay enforcement point.
 policy = ["cedarpy"]
 trace = ["langfuse", "opentelemetry-exporter-otlp-proto-http"]
-dev = ["pytest", "pytest-asyncio", "ruff"]
+# moto mocks DynamoDB in-process, so the storage backends are held to the same
+# assertions as the in-memory ones without an AWS account or a container.
+dev = ["pytest", "pytest-asyncio", "ruff", "moto[dynamodb]"]
 
 [project.scripts]
 pocketchange = "pocketchange.cli:main"

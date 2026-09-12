@@ -150,10 +150,11 @@ def main() -> int:
     # Without a model the critic is absent, and an absent critic approves
     # everything by design. Reporting that as a 0% false-refusal rate would be
     # the same defect this file exists to correct.
-    if not any(os.environ.get(k) for k in
-               ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT")):
-        print("\n  No model is configured, so every plan would be approved by")
-        print("  default. That is not a result. Configure a key and re-run.\n")
+    from pocketchange import bedrock
+
+    if not bedrock.available():
+        print("\n  No model is reachable, so every plan would be approved by")
+        print("  default. That is not a result. Run `aws configure` and retry.\n")
         return 2
 
     print(f"\n\033[1mCRITIC EVALUATION\033[0m\n{BAR}")

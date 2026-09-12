@@ -90,7 +90,7 @@ class State:
             "pocketchange.dev", "principal", keypair=_root_keypair()
         )
         self.root_public_key = token.root_key_from(self.principal.private_key)
-        # Firestore when GOOGLE_CLOUD_PROJECT is set, in-memory otherwise.
+        # DynamoDB when one is configured, in-memory otherwise.
         # Tests and local work must never need cloud credentials.
         self.ledger = ledger_from_env()
         self.replays = ReplayStore()
@@ -100,7 +100,7 @@ class State:
         self.intents: dict[str, str] = {}   # mandate id -> what the human authorised
         self.approvals = ApprovalStore()
         self.registry = _standard_fleet()
-        # Who we have actually paid. Firestore when configured, so the record
+        # Who we have actually paid. DynamoDB when configured, so the record
         # outlives a restart - a reputation that resets every deploy is not one.
         self.counterparties = counterparties.from_env()
         self.memory = memory_bank.from_env()
@@ -154,7 +154,7 @@ def _root_keypair():
 
 
 # Read .env BEFORE the state is built. Everything that decides whether this
-# gateway is live - the Razorpay rail, the Firestore ledger, the Gemini monitor -
+# gateway is live - the Razorpay rail, the durable ledger, the monitor -
 # reads os.environ inside State(), and until now nothing loaded the file. The
 # effect was quiet and total: a fully configured project still reported
 # {"rail": "fake"} because the keys were on disk and never in the process.

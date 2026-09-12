@@ -213,52 +213,60 @@ class InMemoryCounterparties:
         return len(self._rows)
 
 
-class FirestoreCounterparties:
+class DynamoCounterparties:
     """Durable, so the record survives a restart and spans deployments.
 
-    Layout:
-        counterparties/{id}   first_paid, last_paid, orders, total_paise, mandates[]
+    Layout - one partition, one row per counterparty:
 
-    A transaction per settlement, matching FirestoreLedger. The list of mandate
-    ids is kept rather than a count so the figure stays correct when the same
-    mandate pays a supplier twice.
+        pk                sk        attributes
+        COUNTERPARTY      <id>      first_paid, last_paid, orders, total_paise,
+                                    mandates (string set), and the flag counters
+
+    One partition rather than one per counterparty, because `all()` is what the
+    dashboard asks for and a shared partition makes that a Query instead of a
+    Scan. It is a hot partition for writes, which at the rate a supplier book
+    receives settlements is not a rate at all.
+
+    Every mutation here is a single UpdateItem. The backend this replaced needed
+    a read-modify-write transaction to add a mandate id to a list without losing
+    a concurrent one; DynamoDB has native string sets, so `ADD mandates :one`
+    does the union atomically and the transaction disappears.
+
+    The set of mandate ids is kept rather than a count, so the figure stays
+    correct when the same mandate pays a supplier twice.
     """
 
-    def __init__(self, project: str | None = None, prefix: str = "counterparties") -> None:
-        from google.cloud import firestore
+    PARTITION = "COUNTERPARTY"
 
-        self._firestore = firestore
-        self._db = firestore.Client(project=project) if project else firestore.Client()
-        self._prefix = prefix
+    def __init__(self, table=None) -> None:
+        from . import dynamo
 
-    def _ref(self, counterparty: str):
-        return self._db.collection(self._prefix).document(counterparty)
+        self._table = table if table is not None else dynamo.table()
+
+    def _key(self, counterparty: str) -> dict:
+        return {"pk": self.PARTITION, "sk": counterparty}
 
     def record(self, counterparty: str, *, amount_paise: int, mandate_id: str) -> Counterparty:
         key = counterparty.strip()
         if not key:
             raise ValueError("a counterparty needs an identifier to be remembered")
-        ref = self._ref(key)
         now = datetime.now(timezone.utc)
 
-        @self._firestore.transactional
-        def apply(txn):
-            snap = ref.get(transaction=txn)
-            data = snap.to_dict() if snap.exists else {}
-            mandates = set(data.get("mandates", []))
-            mandates.add(mandate_id)
-            row = {
-                "first_paid": data.get("first_paid", now),
-                "last_paid": now,
-                "orders": int(data.get("orders", 0)) + 1,
-                "total_paise": int(data.get("total_paise", 0)) + amount_paise,
-                "mandates": sorted(mandates),
-            }
-            txn.set(ref, row)
-            return row
-
-        row = apply(self._db.transaction())
-        return _row_to_counterparty(key, row)
+        updated = self._table.update_item(
+            Key=self._key(key),
+            UpdateExpression=(
+                "SET first_paid = if_not_exists(first_paid, :now), last_paid = :now "
+                "ADD orders :one, total_paise :amount, mandates :mandate"
+            ),
+            ExpressionAttributeValues={
+                ":now": now.isoformat(),
+                ":one": 1,
+                ":amount": amount_paise,
+                ":mandate": {mandate_id},
+            },
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+        return _row_to_counterparty(key, updated)
 
     def flag(self, counterparty: str, kind: str) -> Counterparty:
         key = counterparty.strip()
@@ -266,36 +274,70 @@ class FirestoreCounterparties:
             raise ValueError("a counterparty needs an identifier to be flagged")
         if kind not in FLAGS:
             raise ValueError(f"unknown flag {kind!r}; expected one of {FLAGS}")
-        ref = self._ref(key)
         now = datetime.now(timezone.utc)
 
-        @self._firestore.transactional
-        def apply(txn):
-            snap = ref.get(transaction=txn)
-            data = dict(snap.to_dict()) if snap.exists else {}
-            data.setdefault("first_paid", now)
-            data.setdefault("last_paid", now)
-            data[kind] = int(data.get(kind, 0)) + 1
-            txn.set(ref, data)
-            return data
-
-        return _row_to_counterparty(key, apply(self._db.transaction()))
+        # The flag counter name is interpolated into the expression, so it goes
+        # through ExpressionAttributeNames rather than into the string. The
+        # membership check above already constrains it to FLAGS; this is the
+        # second lock on the same door, and the door is the one an injected
+        # listing would try.
+        updated = self._table.update_item(
+            Key=self._key(key),
+            UpdateExpression=(
+                "SET first_paid = if_not_exists(first_paid, :now), "
+                "last_paid = if_not_exists(last_paid, :now) "
+                "ADD #flag :one"
+            ),
+            ExpressionAttributeNames={"#flag": kind},
+            ExpressionAttributeValues={":now": now.isoformat(), ":one": 1},
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+        return _row_to_counterparty(key, updated)
 
     def lookup(self, counterparty: str) -> Counterparty | None:
-        snap = self._ref(counterparty.strip()).get()
-        if not snap.exists:
+        key = counterparty.strip()
+        item = self._table.get_item(Key=self._key(key)).get("Item")
+        if not item:
             return None
-        return _row_to_counterparty(counterparty.strip(), snap.to_dict())
+        return _row_to_counterparty(key, item)
 
     def all(self) -> list[Counterparty]:
-        rows = [_row_to_counterparty(d.id, d.to_dict())
-                for d in self._db.collection(self._prefix).stream()]
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        rows: list[Counterparty] = []
+        kwargs = {"KeyConditionExpression": KeyCondition("pk").eq(self.PARTITION)}
+        while True:
+            page = self._table.query(**kwargs)
+            rows.extend(
+                _row_to_counterparty(str(item["sk"]), item)
+                for item in page.get("Items", [])
+            )
+            cursor = page.get("LastEvaluatedKey")
+            if not cursor:
+                break
+            kwargs["ExclusiveStartKey"] = cursor
         return sorted(rows, key=lambda c: -c.orders)
+
+    def __len__(self) -> int:
+        return len(self.all())
 
 
 def _as_datetime(value) -> datetime:
+    """Whatever the store handed back, as an aware datetime.
+
+    DynamoDB has no date type, so these arrive as ISO strings. The in-memory
+    book holds real datetimes. Both have to read the same way, because the
+    dashboard cannot tell which backend it is looking at - and neither should a
+    reader of this file have to.
+    """
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.now(timezone.utc)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc)
 
 
@@ -306,7 +348,7 @@ def _row_to_counterparty(key: str, row: dict) -> Counterparty:
         last_paid=_as_datetime(row.get("last_paid")),
         orders=int(row.get("orders", 0)),
         total_paise=int(row.get("total_paise", 0)),
-        mandates=len(row.get("mandates", []) or []),
+        mandates=len(row.get("mandates") or ()),
         escalated=int(row.get("escalated", 0)),
         refused=int(row.get("refused", 0)),
         vetoed=int(row.get("vetoed", 0)),
@@ -315,15 +357,16 @@ def _row_to_counterparty(key: str, row: dict) -> Counterparty:
 
 
 def from_env() -> CounterpartyBook:
-    """Firestore when a project is configured, in-memory otherwise.
+    """DynamoDB when one is configured, in-memory otherwise.
 
     Same degradation as the ledger: local work and tests must never need cloud
-    credentials, and an unreachable Firestore must not stop a payment.
+    credentials, and unreachable storage must not stop a payment.
     """
-    project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
-    if not project:
+    from . import dynamo
+
+    if not dynamo.configured():
         return InMemoryCounterparties()
     try:
-        return FirestoreCounterparties(project=project)
+        return DynamoCounterparties()
     except Exception:  # noqa: BLE001
         return InMemoryCounterparties()

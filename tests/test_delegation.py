@@ -23,7 +23,7 @@ BASKET = {"LAP-STD-1": 4, "MON-27Q-1": 2, "CHR-ERG-1": 1, "KVM-DCK-1": 1}
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.delenv("RAZORPAY_KEY_ID", raising=False)
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setenv("POCKETCHANGE_NO_DYNAMODB", "1")
     gateway.state = gateway.State()
     gateway.state.monitor = ScriptedMonitor(Verdict.ALLOW, "pinned")
     return TestClient(gateway.app)

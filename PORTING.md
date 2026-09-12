@@ -153,16 +153,42 @@ would have put a millisecond into the headline figure.
 
 ### D7 — DynamoDB replaces Firestore
 
-*(in progress)*
+`ledger.py` already documented the old store as a poor fit: the mandate row is a
+hot document, and one sustained write per second to the same document is that
+database's least favourite pattern. Its own comment wished for "a relational
+database with SELECT ... FOR UPDATE".
 
-`ledger.py` already documented Firestore as a poor fit: the mandate row is a hot
-document, and Firestore's least favourite pattern is one sustained write per
-second to the same document. DynamoDB's conditional writes and atomic `ADD` are
-a *better* fit for a ledger than what was there before — the budget check and
-the decrement become one conditional update, which is the invariant the
-two-phase reservation exists to protect.
+DynamoDB gets closer than either. The invariant the two-phase reservation exists
+to protect is *reserve only if cap − committed − reserved ≥ amount*, and the old
+backend needed a transaction that read the row, did the arithmetic in Python and
+wrote the result — three steps whose correctness rested on the transaction's
+isolation. DynamoDB does it in one request, where the check and the decrement
+are the same operation. There is no window between them because there is no
+"between".
 
-Runs locally against DynamoDB Local / LocalStack, so no AWS account is needed.
+**Why `available_paise` is stored rather than derived.** It is exactly
+`cap − committed − reserved` and looks like the sort of denormalisation that
+rots. It is there because a DynamoDB condition expression *cannot do
+arithmetic* — that is allowed in `SET` and nowhere else, so the obvious
+condition is not one that can be written. Keeping the difference in a column is
+what makes the guard a single atomic comparison instead of a read, a subtraction
+in Python, and a hope. Every mutation maintains it in the same write that
+changes its inputs, and `scripts/smoke_dynamodb.py` asserts the two still agree.
+
+**A latent bug this closed.** `memory.from_env()` imported
+`memory_firestore.FirestoreBank` inside a `try/except`, and that module had never
+been written. The `except` swallowed the `ImportError`, so a fully configured
+deployment silently kept standing orders in process memory and lost them on the
+next deploy — the feature whose entire point is authority that outlives the
+conversation did not outlive the process. Nothing failed and no test noticed,
+because there were no tests for it.
+
+**Optimistic concurrency on the standing-order bank.** `record_check` enforces a
+period budget, which is the same class of invariant as the ledger's cap, so a
+plain read-modify-write would reopen exactly the race the ledger exists to
+close. Each row carries a version and every mutation is conditional on it.
+
+Runs locally against DynamoDB Local or LocalStack, so no AWS account is needed.
 
 ### D8 — The repository is no longer a fork
 
@@ -212,10 +238,22 @@ code was technically all-rights-reserved. Added the Apache-2.0 text and a
 | `pocketchange/cedar.py` | new | Loads and evaluates it; maps a decision back to the message and status the gateway answers with. Parsed once at import. |
 | `pocketchange/gateway.py` | two `if`s removed | Broker separation and the payout switch now come from the policy file. A new `_role()` derives the principal's role from the token chain — never from the request body, since a role the caller can assert is not a role. |
 
+### Storage
+
+| File | Change | Why |
+|---|---|---|
+| `pocketchange/dynamo.py` | new | Table handle, local-endpoint support, table creation, and the cancellation-reason reader that keeps three different failures distinguishable. |
+| `pocketchange/ledger.py` | `FirestoreLedger` → `DynamoLedger` | One conditional write instead of a read-modify-write transaction. Carries a long note about boto3's document interface — the first version serialised values by hand and every transaction leg failed with `unhashable type: dict`, because the resource's client serialises them already. |
+| `pocketchange/counterparties.py` | `FirestoreCounterparties` → `DynamoCounterparties` | Native string sets do the mandate-id union atomically, so the read-modify-write transaction disappears entirely. One partition, so `all()` is a Query rather than a Scan. |
+| `pocketchange/memory.py` | `DynamoBank` written from scratch | There was no durable bank — see D7. Version-guarded writes, because it enforces a budget. |
+| `scripts/smoke_dynamodb.py` | replaces `smoke_firestore.py` | The suite proves the invariants against a mock, which cannot tell you your credentials resolve or that the real service accepts your condition expressions. |
+
 ### Tests
 
 | File | Change | Why |
 |---|---|---|
+| `tests/test_ledger_backends.py` | new | 17 properties × both backends. The gateway "never learns which backend it has" was a claim with nothing checking it, and the durable ledger had no tests at all — for the module the project calls "the file the project exists for". |
+| `tests/test_store_backends.py` | new | The same treatment for the counterparty book and the standing-order bank. |
 | `tests/test_cedar.py` | new | Each rule end to end, plus fail-closed and hostile entity ids. Cedar identifies policies positionally, so the annotation mapping is the fragile part and is tested through the round trip rather than directly. |
 | `tests/test_gateway.py` | **flake fixed** | `test_replay_...does_not_charge_twice` failed about one run in four, and had before this port. `/replay` reports `charged_twice` by comparing the mandate's *whole* committed total, while the run that produced the payment is still settling siblings — so a concurrent settlement was indistinguishable from a double charge. The test now waits for the ledger to go quiet. See §5: the endpoint is still imprecise. |
 | `tests/conftest.py` | hardened | **The trap of the port.** Clearing `AWS_*` does not take a process offline — boto3 also reads `~/.aws/config`, an SSO cache and instance metadata. On any machine where `aws configure` had been run, the suite quietly went back on the network. `POCKETCHANGE_NO_BEDROCK` is checked before boto3 is consulted at all. |

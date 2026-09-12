@@ -312,7 +312,7 @@ function drawLatency() {
   const overNetwork = me !== null && me > 50
   $('latency').innerHTML =
     row('Enforcement', me, overNetwork
-      ? 'includes a Firestore round trip; 0.164 ms with the in-memory ledger'
+      ? 'includes a DynamoDB round trip; 0.164 ms with the in-memory ledger'
       : 'signature, expiry, depth, scope, cumulative spend, idempotency') +
     row('Judgement', mj, jud.length ? `${jud.length} model call${jud.length === 1 ? '' : 's'}`
                                     : 'monitor not run') +

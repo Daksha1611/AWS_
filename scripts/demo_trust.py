@@ -37,7 +37,7 @@ def heading(text: str) -> None:
 def main() -> int:
     gateway.state = gateway.State()
     gateway.state.rail = FakeRail()
-    # Pinned too. State() reaches Firestore when a project is configured, so on a
+    # Pinned too. State() reaches DynamoDB when one is configured, so on a
     # configured machine this demo would accumulate history across runs and print
     # different numbers every time - which is the durability working, and useless
     # in something meant to be reproducible.

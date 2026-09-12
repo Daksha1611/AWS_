@@ -591,7 +591,7 @@ def test_replay_of_an_unknown_entry_is_a_404(client):
 
 
 def test_a_run_reports_which_decomposer_ran(client, monkeypatch):
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("POCKETCHANGE_NO_BEDROCK", "1")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     body = client.post("/runs", json={
         "task": "anything", "budget_paise": 50_000 * RUPEE, "decomposer": "auto",
@@ -1039,9 +1039,9 @@ def test_status_names_an_unjudged_deployment_as_degraded(client, monkeypatch):
     from pocketchange import gateway
     from pocketchange.monitor import from_env
 
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("POCKETCHANGE_NO_BEDROCK", "1")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setenv("POCKETCHANGE_NO_DYNAMODB", "1")
     gateway.state.monitor = from_env()
 
     can = client.get("/status").json()["capabilities"]

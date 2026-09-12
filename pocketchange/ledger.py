@@ -89,9 +89,12 @@ class LedgerState:
 class Ledger(Protocol):
     """The interface the gateway depends on.
 
-    MemoryLedger implements it for development and tests; FirestoreLedger will
-    implement it against real storage. The gateway never learns which it has,
-    so swapping backends changes one line of wiring and no logic.
+    MemoryLedger implements it for development and tests; DynamoLedger implements
+    it against real storage. The gateway never learns which it has, so swapping
+    backends changes one line of wiring and no logic.
+
+    tests/test_ledger_backends.py holds both to the same assertions, because
+    that claim is only worth making if something checks it.
     """
 
     def open(self, mandate_id: str, cap_paise: int) -> LedgerState: ...
@@ -243,200 +246,368 @@ class MemoryLedger:
         )
 
 
-# --- Firestore ------------------------------------------------------------
+# --- DynamoDB -------------------------------------------------------------
 #
 # Same protocol, durable storage. The gateway never learns which backend it has.
 #
-# One design note that matters. The obvious schema is "reservations are
-# documents, sum them to get the held total" - but Firestore transactions cannot
-# freely query inside themselves, and summing a growing collection on every
-# payment gets slower forever. So `reserved_paise` is a counter on the mandate
-# document, adjusted in the same transaction that writes the reservation.
+# The backend this replaced needed a transaction that read the mandate, did the
+# budget arithmetic in Python and wrote the result back, and its own comment
+# admitted the fit was poor: the mandate row is a hot document, and "a relational
+# database with SELECT ... FOR UPDATE would express this invariant more
+# naturally".
 #
-# That makes the mandate document a hot document, which is Firestore's least
-# favourite pattern (roughly one sustained write per second each). At demo scale
-# it never bites, and it is the honest trade: a relational database with
-# SELECT ... FOR UPDATE would express this invariant more naturally. Firestore is
-# here because ATA requires a Google Cloud service, not because it is the best
-# fit for a ledger.
+# DynamoDB expresses it in one request. The condition and the decrement are the
+# same operation:
+#
+#     SET       reserved_paise  = reserved_paise  + :amount,
+#               available_paise = available_paise - :amount
+#     IF        available_paise >= :amount
+#
+# There is no window between the check and the write, because there is no
+# "between". Closing that window is the entire reason this module exists - see
+# the header - and it is now the database enforcing it rather than our careful
+# use of one.
+#
+# Which is why `available_paise` is stored rather than derived. It is exactly
+# `cap - committed - reserved` and looks like the kind of denormalisation that
+# rots, but a condition expression cannot do arithmetic - DynamoDB allows it in
+# SET and nowhere else, so `cap_paise - committed_paise - reserved_paise >=
+# :amount` is not a condition that can be written. Keeping the difference in a
+# column is what makes the guard a single atomic comparison instead of a
+# read, a subtraction in Python, and a hope.
+#
+# Every mutation below maintains the invariant in the same write that changes
+# its inputs, so the two cannot drift: reserve moves available to reserved,
+# commit moves reserved to committed and leaves available alone, release puts
+# it back.
+#
+# See pocketchange/dynamo.py for the table layout.
 
 
-class FirestoreLedger:
-    """Durable ledger. Every mutation runs inside a Firestore transaction.
+class DynamoLedger:
+    """Durable ledger. Every mutation is one conditional write or one transaction."""
 
-    Layout:
-        mandates/{mandate_id}                     cap, committed, reserved
-        mandates/{mandate_id}/reservations/{id}   amount, idem key, settled
-        mandates/{mandate_id}/idem/{key}          -> reservation id
-    """
+    def __init__(self, table=None) -> None:
+        from . import dynamo
 
-    def __init__(self, project: str | None = None, prefix: str = "mandates") -> None:
-        from google.cloud import firestore
+        self._table = table if table is not None else dynamo.table()
+        self._dynamo = dynamo
 
-        self._firestore = firestore
-        self._db = firestore.Client(project=project) if project else firestore.Client()
-        self._prefix = prefix
+    # --- keys --------------------------------------------------------------
 
-    def _mandate_ref(self, mandate_id: str):
-        return self._db.collection(self._prefix).document(mandate_id)
+    @staticmethod
+    def _mandate_key(mandate_id: str) -> dict:
+        return {"pk": f"MANDATE#{mandate_id}", "sk": "STATE"}
+
+    @staticmethod
+    def _reservation_key(mandate_id: str, reservation_id: str) -> dict:
+        return {"pk": f"MANDATE#{mandate_id}", "sk": f"RES#{reservation_id}"}
+
+    @staticmethod
+    def _idem_key(mandate_id: str, idempotency_key: str) -> dict:
+        return {"pk": f"MANDATE#{mandate_id}", "sk": f"IDEM#{idempotency_key}"}
+
+    @staticmethod
+    def _index_key(reservation_id: str) -> dict:
+        return {"pk": f"RES#{reservation_id}", "sk": "INDEX"}
+
+    # --- the protocol ------------------------------------------------------
 
     def open(self, mandate_id: str, cap_paise: int) -> LedgerState:
+        """Register a mandate's ceiling. Safe to call repeatedly.
+
+        Reopening with a different cap is refused. Otherwise a compromised agent
+        could raise its own limit by asking twice - so the condition is "this row
+        does not exist", and a collision is inspected rather than overwritten.
+        """
         if cap_paise < 0:
             raise ValueError(f"negative cap: {cap_paise}")
-        ref = self._mandate_ref(mandate_id)
-        snapshot = ref.get()
-        if snapshot.exists:
-            existing = snapshot.to_dict()
-            if existing["cap_paise"] != cap_paise:
+
+        from botocore.exceptions import ClientError
+
+        try:
+            self._table.put_item(
+                Item={
+                    **self._mandate_key(mandate_id),
+                    "cap_paise": cap_paise,
+                    "committed_paise": 0,
+                    "reserved_paise": 0,
+                    "available_paise": cap_paise,
+                },
+                ConditionExpression="attribute_not_exists(pk)",
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            existing = self.state(mandate_id)
+            if existing.cap_paise != cap_paise:
                 raise LedgerError(
-                    f"mandate {mandate_id[:12]} already open at {existing['cap_paise']}p, "
+                    f"mandate {mandate_id[:12]} already open at {existing.cap_paise}p, "
                     f"refusing to reopen at {cap_paise}p"
-                )
-        else:
-            ref.set({"cap_paise": cap_paise, "committed_paise": 0, "reserved_paise": 0})
+                ) from exc
         return self.state(mandate_id)
 
     def reserve(self, mandate_id: str, amount_paise: int, idempotency_key: str) -> Reservation:
+        """Hold budget against the cap, or refuse.
+
+        One transaction, four legs. The order of the legs is the order their
+        failures are reported in, which is what lets a cancelled transaction be
+        turned back into the right exception.
+        """
         if amount_paise <= 0:
             raise ValueError(f"reservation must be positive, got {amount_paise}")
         if not idempotency_key.strip():
             raise ValueError("idempotency key is required")
 
-        mandate_ref = self._mandate_ref(mandate_id)
-        idem_ref = mandate_ref.collection("idem").document(idempotency_key)
+        from botocore.exceptions import ClientError
+
         reservation_id = uuid.uuid4().hex
-        reservation_ref = mandate_ref.collection("reservations").document(reservation_id)
+        created_at = datetime.now(timezone.utc)
+        name = self._table.name
 
-        @self._firestore.transactional
-        def txn(transaction):
-            # Reads first - Firestore requires every read in a transaction to
-            # precede every write.
-            prior = idem_ref.get(transaction=transaction)
-            if prior.exists:
-                held = (
-                    mandate_ref.collection("reservations")
-                    .document(prior.to_dict()["reservation_id"])
-                    .get(transaction=transaction)
-                )
-                return held.id, held.to_dict()
+        try:
+            self._table.meta.client.transact_write_items(TransactItems=[
+                # Leg 0: the idempotency claim. Fails if this exact request was
+                # already reserved, which is what stops an in-TTL replay from
+                # being charged twice.
+                {"Put": {
+                    "TableName": name,
+                    "Item": self._idem_key(mandate_id, idempotency_key)
+                                    | {"reservation_id": reservation_id},
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }},
+                # Leg 1: the budget. The check and the decrement are one
+                # operation, so there is no window between them.
+                {"Update": {
+                    "TableName": name,
+                    "Key": self._mandate_key(mandate_id),
+                    "UpdateExpression":
+                        "SET reserved_paise = reserved_paise + :amount, "
+                        "available_paise = available_paise - :amount",
+                    "ConditionExpression":
+                        "attribute_exists(pk) AND available_paise >= :amount",
+                    "ExpressionAttributeValues": {":amount": amount_paise},
+                }},
+                {"Put": {
+                    "TableName": name,
+                    "Item": {
+                        **self._reservation_key(mandate_id, reservation_id),
+                        "amount_paise": amount_paise,
+                        "idempotency_key": idempotency_key,
+                        "created_at": created_at.isoformat(),
+                        "settled": False,
+                    },
+                }},
+                # Leg 3: the reverse index, so settlement is O(1) from a
+                # reservation id alone.
+                {"Put": {
+                    "TableName": name,
+                    "Item": self._index_key(reservation_id)
+                                    | {"mandate_id": mandate_id},
+                }},
+            ])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "TransactionCanceledException":
+                raise
+            return self._explain_failed_reservation(
+                exc, mandate_id, amount_paise, idempotency_key)
 
-            snapshot = mandate_ref.get(transaction=transaction)
-            if not snapshot.exists:
-                raise UnknownMandate(f"no mandate opened for {mandate_id[:12]}")
-            m = snapshot.to_dict()
-
-            available = m["cap_paise"] - m["committed_paise"] - m["reserved_paise"]
-            if amount_paise > available:
-                raise InsufficientBudget(
-                    requested=amount_paise, available=available, cap=m["cap_paise"],
-                    committed=m["committed_paise"], reserved=m["reserved_paise"],
-                )
-
-            record = {
-                "amount_paise": amount_paise,
-                "idempotency_key": idempotency_key,
-                "created_at": datetime.now(timezone.utc),
-                "settled": False,
-            }
-            transaction.set(reservation_ref, record)
-            transaction.set(idem_ref, {"reservation_id": reservation_id})
-            # Reverse index: the gateway holds only a reservation id when it
-            # settles, and a reservation lives under its mandate. One small
-            # write here buys an O(1) lookup instead of a scan.
-            transaction.set(
-                self._db.collection(f"{self._prefix}_index").document(reservation_id),
-                {"mandate_id": mandate_id},
-            )
-            transaction.update(
-                mandate_ref,
-                {"reserved_paise": self._firestore.Increment(amount_paise)},
-            )
-            return reservation_id, record
-
-        found_id, data = txn(self._db.transaction())
         return Reservation(
-            id=found_id,
+            id=reservation_id,
             mandate_id=mandate_id,
-            amount_paise=data["amount_paise"],
-            idempotency_key=data["idempotency_key"],
-            created_at=data["created_at"],
-            settled=data.get("settled", False),
+            amount_paise=amount_paise,
+            idempotency_key=idempotency_key,
+            created_at=created_at,
         )
 
+    def _explain_failed_reservation(
+        self, exc, mandate_id: str, amount_paise: int, idempotency_key: str
+    ) -> Reservation:
+        """Turn a cancelled transaction back into the exception the caller expects.
+
+        Three outcomes are handled completely differently upstream - a replay
+        returns the original receipt, an over-budget request is a 402 carrying
+        the numbers, an unknown mandate is a 404 - and a transaction reports all
+        three as one cancellation. Reading the per-leg reasons is what keeps them
+        distinguishable.
+        """
+        reasons = self._dynamo.cancellation_reasons(exc)
+        failed = {
+            index for index, code in enumerate(reasons)
+            if code == "ConditionalCheckFailed"
+        }
+
+        if 0 in failed:
+            # The idempotency claim lost: this request was already reserved, so
+            # the honest answer is the original reservation.
+            prior = self._table.get_item(
+                Key=self._idem_key(mandate_id, idempotency_key)).get("Item")
+            if prior:
+                held = self._table.get_item(
+                    Key=self._reservation_key(mandate_id, prior["reservation_id"])
+                ).get("Item")
+                if held:
+                    return _as_reservation(mandate_id, held)
+
+        if 1 in failed:
+            # The budget condition lost. It covers two different facts - "no such
+            # mandate" and "not enough left" - so ask which.
+            current = self.state(mandate_id)   # raises UnknownMandate if absent
+            raise InsufficientBudget(
+                requested=amount_paise,
+                available=current.available_paise,
+                cap=current.cap_paise,
+                committed=current.committed_paise,
+                reserved=current.reserved_paise,
+            ) from exc
+
+        raise LedgerError(f"reservation refused: {'; '.join(reasons) or exc}") from exc
+
     def commit(self, reservation_id: str) -> LedgerState:
-        mandate_id, mandate_ref, reservation_ref = self._locate(reservation_id)
+        """The payment succeeded. Turn the hold into spend."""
+        from botocore.exceptions import ClientError
 
-        @self._firestore.transactional
-        def txn(transaction):
-            snapshot = reservation_ref.get(transaction=transaction)
-            if not snapshot.exists or snapshot.to_dict().get("settled"):
-                raise UnknownReservation(f"no open reservation {reservation_id[:12]}")
-            amount = snapshot.to_dict()["amount_paise"]
-            transaction.update(reservation_ref, {"settled": True})
-            transaction.update(mandate_ref, {
-                "committed_paise": self._firestore.Increment(amount),
-                "reserved_paise": self._firestore.Increment(-amount),
-            })
-
-        txn(self._db.transaction())
+        mandate_id, reservation = self._locate(reservation_id)
+        amount = int(reservation["amount_paise"])
+        name = self._table.name
+        try:
+            self._table.meta.client.transact_write_items(TransactItems=[
+                {"Update": {
+                    "TableName": name,
+                    "Key": self._reservation_key(mandate_id, reservation_id),
+                    "UpdateExpression": "SET settled = :yes",
+                    # Settling twice would double-count the spend, so being
+                    # unsettled is part of the condition rather than something
+                    # checked beforehand and hoped to still hold.
+                    "ConditionExpression": "attribute_exists(pk) AND settled = :no",
+                    "ExpressionAttributeValues": {":yes": True, ":no": False},
+                }},
+                {"Update": {
+                    "TableName": name,
+                    "Key": self._mandate_key(mandate_id),
+                    # available_paise is untouched: a settlement moves money
+                    # from held to spent, and neither is available.
+                    "UpdateExpression":
+                        "SET committed_paise = committed_paise + :amount, "
+                        "reserved_paise = reserved_paise - :amount",
+                    "ExpressionAttributeValues": {":amount": amount},
+                }},
+            ])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "TransactionCanceledException":
+                raise
+            raise UnknownReservation(
+                f"no open reservation {reservation_id[:12]}") from exc
         return self.state(mandate_id)
 
     def release(self, reservation_id: str) -> LedgerState:
-        mandate_id, mandate_ref, reservation_ref = self._locate(reservation_id)
+        """The payment failed. Give the budget back.
 
-        @self._firestore.transactional
-        def txn(transaction):
-            snapshot = reservation_ref.get(transaction=transaction)
-            if not snapshot.exists or snapshot.to_dict().get("settled"):
-                raise UnknownReservation(f"no open reservation {reservation_id[:12]}")
-            data = snapshot.to_dict()
-            transaction.delete(reservation_ref)
-            transaction.delete(mandate_ref.collection("idem").document(data["idempotency_key"]))
-            transaction.delete(
-                self._db.collection(f"{self._prefix}_index").document(reservation_id)
-            )
-            transaction.update(
-                mandate_ref,
-                {"reserved_paise": self._firestore.Increment(-data["amount_paise"])},
-            )
+        The idempotency claim is released too. A payment that never happened
+        should be retryable - only a *successful* charge must stay pinned.
+        """
+        from botocore.exceptions import ClientError
 
-        txn(self._db.transaction())
+        mandate_id, reservation = self._locate(reservation_id)
+        amount = int(reservation["amount_paise"])
+        name = self._table.name
+        try:
+            self._table.meta.client.transact_write_items(TransactItems=[
+                {"Delete": {
+                    "TableName": name,
+                    "Key": self._reservation_key(mandate_id, reservation_id),
+                    "ConditionExpression": "attribute_exists(pk) AND settled = :no",
+                    "ExpressionAttributeValues": {":no": False},
+                }},
+                {"Delete": {
+                    "TableName": name,
+                    "Key": self._idem_key(
+                        mandate_id, str(reservation["idempotency_key"])),
+                }},
+                {"Delete": {
+                    "TableName": name,
+                    "Key": self._index_key(reservation_id),
+                }},
+                {"Update": {
+                    "TableName": name,
+                    "Key": self._mandate_key(mandate_id),
+                    "UpdateExpression":
+                        "SET reserved_paise = reserved_paise - :amount, "
+                        "available_paise = available_paise + :amount",
+                    "ExpressionAttributeValues": {":amount": amount},
+                }},
+            ])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "TransactionCanceledException":
+                raise
+            raise UnknownReservation(
+                f"no open reservation {reservation_id[:12]}") from exc
         return self.state(mandate_id)
 
     def state(self, mandate_id: str) -> LedgerState:
-        snapshot = self._mandate_ref(mandate_id).get()
-        if not snapshot.exists:
+        item = self._table.get_item(Key=self._mandate_key(mandate_id)).get("Item")
+        if not item:
             raise UnknownMandate(f"no mandate opened for {mandate_id[:12]}")
-        m = snapshot.to_dict()
         return LedgerState(
             mandate_id=mandate_id,
-            cap_paise=m["cap_paise"],
-            committed_paise=m["committed_paise"],
-            reserved_paise=m["reserved_paise"],
+            cap_paise=int(item["cap_paise"]),
+            committed_paise=int(item["committed_paise"]),
+            reserved_paise=int(item["reserved_paise"]),
         )
 
-    def _locate(self, reservation_id: str):
+    def _locate(self, reservation_id: str) -> tuple[str, dict]:
         """Resolve a reservation id to its mandate via the reverse index."""
-        entry = self._db.collection(f"{self._prefix}_index").document(reservation_id).get()
-        if not entry.exists:
+        entry = self._table.get_item(Key=self._index_key(reservation_id)).get("Item")
+        if not entry:
             raise UnknownReservation(f"no open reservation {reservation_id[:12]}")
-        mandate_id = entry.to_dict()["mandate_id"]
-        mandate_ref = self._mandate_ref(mandate_id)
-        return mandate_id, mandate_ref, mandate_ref.collection("reservations").document(
-            reservation_id
-        )
+        mandate_id = str(entry["mandate_id"])
+        reservation = self._table.get_item(
+            Key=self._reservation_key(mandate_id, reservation_id)).get("Item")
+        if not reservation or reservation.get("settled"):
+            raise UnknownReservation(f"no open reservation {reservation_id[:12]}")
+        return mandate_id, reservation
+
+
+def _as_reservation(mandate_id: str, item: dict) -> Reservation:
+    return Reservation(
+        id=str(item["sk"]).removeprefix("RES#"),
+        mandate_id=mandate_id,
+        amount_paise=int(item["amount_paise"]),
+        idempotency_key=str(item["idempotency_key"]),
+        created_at=datetime.fromisoformat(str(item["created_at"])),
+        settled=bool(item.get("settled", False)),
+    )
+
+
+# A note for the next person who reaches for boto3's TypeSerializer here.
+#
+# `transact_write_items` is a client-level call, and the client-level API takes
+# DynamoDB's wire form - {"S": "x"} rather than "x" - so the obvious thing is to
+# serialise every Item, Key and ExpressionAttributeValue on the way in. That was
+# the first version of this file and every leg of every transaction failed with
+# "unhashable type: dict".
+#
+# The reason: this client came from `Table.meta.client`, and boto3 attaches the
+# document-interface transformation to the dynamodb *resource's* client. It
+# serialises the parameters itself. Doing it first means doing it twice, and the
+# resulting {"S": {"S": "x"}} is not a value DynamoDB can key on.
+#
+# So plain Python values go in, everywhere in this class, including the
+# transactions. Use a client built by `boto3.client("dynamodb")` and the rule is
+# the opposite one.
 
 
 def from_env() -> Ledger:
-    """FirestoreLedger when a project is configured, MemoryLedger otherwise.
+    """DynamoLedger when one is configured, MemoryLedger otherwise.
 
     Development and tests must never require cloud credentials, so absence of
     configuration degrades to in-memory rather than failing.
     """
-    project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
-    if not project:
+    from . import dynamo
+
+    if not dynamo.configured():
         return MemoryLedger()
     try:
-        return FirestoreLedger(project=project)
-    except Exception:  # noqa: BLE001 - unreachable Firestore must not stop local work
+        return DynamoLedger()
+    except Exception:  # noqa: BLE001 - unreachable storage must not stop local work
         return MemoryLedger()

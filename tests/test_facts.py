@@ -56,7 +56,7 @@ def test_facts_survives_a_broken_store(client, monkeypatch):
     """The front page must not fail to render because a counter is unavailable."""
     class Broken:
         def all(self):
-            raise RuntimeError("firestore unreachable")
+            raise RuntimeError("counterparty store unreachable")
 
     monkeypatch.setattr(gateway.state, "counterparties", Broken())
     body = client.get("/facts").json()
