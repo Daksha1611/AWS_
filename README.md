@@ -255,17 +255,34 @@ One model call per *branch*, not per node.
 ```
 enforcement    0.184 ms   in-memory ledger — signature, expiry, depth, scope,
                           cumulative spend, idempotency, two-phase reservation
-enforcement    ~190 ms    the same checks, Firestore, from a local process
-enforcement    ~3,600 ms  the same checks, Firestore, from Cloud Run (median of
-                          6 live payments; min 94 ms, max 4,799 ms)
 judgement      seconds    one model call — optional, separable, fails open
 ```
 
-The three figures are the same code, and the spread is the honest finding: this
-is a **two-phase reservation inside a Firestore transaction**, so the cost is
-round trips, not computation. From Cloud Run the median is roughly twenty times
-the local figure and the spread is enormous — 94 ms to 4.8 s — because a cold
+**The durable-storage figures below are from the previous stack and have not
+been re-measured.** They are kept because the *shape* of the finding survives a
+change of database and is the part worth knowing; the absolute numbers do not
+transfer and are not being claimed for DynamoDB.
+
+```
+enforcement    ~190 ms    the same checks against a managed document store,
+                          from a local process
+enforcement    ~3,600 ms  the same checks from a serverless container (median
+                          of 6 live payments; min 94 ms, max 4,799 ms)
+```
+
+Those three figures were the same code, and the spread was the honest finding:
+this is a **two-phase reservation**, so the cost is round trips, not
+computation. From a serverless container the median was roughly twenty times
+the local figure and the spread was enormous — 94 ms to 4.8 s — because a cold
 instance pays for connection setup that a warm one does not.
+
+One thing that *did* change with DynamoDB and is worth stating: the previous
+backend needed a transaction that read the mandate row, did the budget
+arithmetic in the process, and wrote it back. DynamoDB does the check and the
+decrement in a single conditional write, so where there were several round trips
+under a lock there is now one request. Whether that shows up as a smaller number
+is **unmeasured**: `eval/latency.py` times the in-memory ledger only, and
+pointing it at a durable backend is an obvious next step nobody has taken.
 
 **The sub-millisecond figure is the in-memory ledger, and saying so matters.**
 Quoting it for a cloud deployment would be measuring the wrong system by a
@@ -302,7 +319,7 @@ explicit that a safety figure without a usefulness figure is not a result — an
 until recently this project had *neither*, because the real monitor was covered
 by no test at all while judging every payment.
 
-Run it yourself: `python -m eval.monitor` (needs a Gemini key; ~12 calls).
+Run it yourself: `python -m eval.monitor` (needs AWS credentials for Bedrock; ~12 calls).
 
 ---
 
@@ -338,23 +355,77 @@ verdict. This is what moved SoK **I2M** out of the not-applicable column.
 
 ---
 
-## Two doors to Gemini, and only one is Google Cloud
+## Why the model moved to Bedrock
 
-Worth being exact about, because it is easy to state wrongly:
+Not for the badge. The model this project used before authenticated with a bare
+API key that belonged to whoever pasted it into `.env` — and the component
+holding that key is the **monitor**, the piece the whole design calls trusted
+and asks whether a payment should proceed.
 
-| | AI Studio | Vertex AI |
+A trusted component whose credential is a shared secret nobody administers is
+only nominally trusted. On Bedrock the call is signed by the ordinary AWS
+credential chain — a role, an SSO profile, instance metadata — so the model is
+reached exactly the way the ledger's table is, and `bedrock:InvokeModel` can be
+scoped to named model ids. `deploy/template.yaml` scopes it to two, rather than
+to `*`, which is the least this project can do given what it argues about
+everywhere else.
+
+Three tiers, because it is three different jobs:
+
+| | model | why |
 |---|---|---|
-| endpoint | `generativelanguage.googleapis.com` | `aiplatform.googleapis.com` |
-| auth | API key | the project's own credentials |
-| billing | free tier, **separate from GCP** | the project, paid by credits |
-| flash limit | **20 requests a day** | ordinary Vertex quota |
-| shows as GCP usage | **no** | yes |
+| buyer's reasoning | `anthropic.claude-opus-5` | planning, decomposition, choosing between carts |
+| the fan-out | `anthropic.claude-sonnet-5` | three shoppers, run concurrently |
+| the monitor | `anthropic.claude-haiku-4-5` | **deliberately the smallest** |
 
-Hitting the AI Studio rate limit tells you nothing about your Cloud Run bill;
-they are unrelated meters. This project now prefers **Vertex** whenever
-`GOOGLE_CLOUD_PROJECT` is set, which is what makes the model work actual Google
-Cloud usage rather than a Google API call that happens to sit beside it.
-`POCKETCHANGE_NO_VERTEX=1` forces the API-key path back.
+The monitor being cheapest is a design decision, not a saving. It is the trusted
+layer of an AI-control arrangement and it answers one narrow question; a trusted
+layer should be simple enough to reason about.
+
+One thing the port deleted outright: the old provider metered its free tier *per
+model name*, so parallel agents had to be handed different model names or they
+queued behind one bucket. Bedrock meters per account and region, so that trick
+buys nothing and distinct ids would only mean agents of unequal ability. The
+test that asserted every agent got its own model now asserts the opposite.
+`PORTING.md` D3 has the reasoning.
+
+## The rules we chose, separated from the ones we proved
+
+For most of this project's life the money path made a distinction in its comments
+that it could not make in its code. Some of what `/pay` enforces is a
+**cryptographic guarantee** — the signature, the chain, scope, expiry, depth.
+Some of it is a **rule someone decided to apply**. Both were `if` statements,
+indistinguishable to a reader, in a two-thousand-line module. One of them even
+said so out loud:
+
+> *the per-seller caps below are a cryptographic guarantee; this line is a rule
+> we chose to apply here.*
+
+The chosen ones now live in [`policies/pay.cedar`](policies/pay.cedar), which is
+the shortest complete statement of what this system permits:
+
+```cedar
+// A broker may delegate, not spend.
+@id("broker-may-not-spend")
+forbid (principal, action == Action::"pay", resource)
+when { principal has role && principal.role == "broker" };
+```
+
+That rule exists because attenuation is monotonic: a broker that can grant `pay`
+to its sub-payers must carry `pay` itself, and the token language cannot express
+*"may grant but not exercise"*. So the enforcement point says it instead — and
+now says it somewhere a reviewer can find in under a minute.
+
+**The file is deliberately tiny, and that is the argument rather than an
+apology.** Moving the scope and budget checks in as well would have made a more
+impressive-looking policy and a worse system: a policy engine asked to
+re-confirm what a signature already settled is a second opinion on a fact, and a
+Cedar rule that agreed with the token would be decoration that could later drift
+out of agreement with it.
+
+It **fails closed** — an unanswerable policy question refuses with a 503 — which
+is the opposite of how the monitor fails, and deliberately so. The monitor is a
+second opinion. This is the only thing standing between a broker and the money.
 
 ## Judging the plan, not just the payment
 
@@ -390,17 +461,25 @@ spending outage, which is the dependency this design exists to avoid.
 
 It is asked once per **branch**, not per node — branch points are where authority
 is created, and judging leaves would multiply cost for the layer that holds
-least. On a 121-node tree that is 40 extra calls. At AI Studio's 15 a minute it
-was unthinkable; on Vertex it is nothing, which is the honest reason this
-component did not exist until now.
+least. On a 121-node tree that is 40 extra calls. Under the per-minute free tier
+this project used to run on that was unthinkable, which is the honest reason the
+component did not exist until late; on Bedrock it is a billing line, not a wall.
 
 ## When the model is not there
 
-Gemini's free tier is **15 requests a minute**, and that — not correctness, not
-design — has been the binding constraint on this project throughout. A system
-that stops working because one decomposition hit a 429 has failed for the least
-interesting possible reason, and it fails at exactly the moment someone is
-looking at it.
+A per-minute free tier was the binding constraint on this project throughout its
+first life — not correctness, not design, quota. A system that stops working
+because one decomposition hit a 429 has failed for the least interesting
+possible reason, and it fails at exactly the moment someone is looking at it.
+
+Bedrock removes the cliff, which raises a fair question about why the fallback
+chain below survived the port at all. Two reasons: a throttle is still a
+throttle, and the monitor **fails open** when it cannot reach a model — so the
+window in which the second layer silently stops existing is worth narrowing with
+something that does not share Bedrock's failure modes. Keeping a non-AWS path
+reachable is also what lets this project keep claiming the enforcement layer is
+provider-neutral. That claim is cheap to make and impossible to check once the
+alternative is deleted.
 
 So `pocketchange/providers.py` is a chain, not a spare. Measured while writing
 it, with real keys:
@@ -415,8 +494,10 @@ sambanova   HTTP 429          rate limit exceeded
 **Two of the four were unavailable at that moment.** A single fallback would
 have been a coin toss. The chain walks past both.
 
-Verified end to end by breaking Gemini on purpose: the decomposer produced the
-same four sensible sub-tasks from Groq **in 1.5 s, faster than Gemini's 1.9 s**.
+Verified end to end by breaking the primary on purpose: the decomposer produced
+the same four sensible sub-tasks from Groq **in 1.5 s, faster than the primary's
+1.9 s**. (Both figures are from the pre-port stack and have not been
+re-measured against Bedrock.)
 With nothing configured at all it raises rather than returning an empty answer —
 a caller that cannot tell *no answer* from *the answer was nothing* is how a
 degenerate reply became a confident decision here once already.
@@ -461,18 +542,20 @@ would break without it.
 | dependency | the job it does |
 |---|---|
 | **Razorpay** *(test mode only)* | Every leaf payment is a real Orders API call. `from_env()` **refuses `rzp_live_` keys outright.** We close the idempotency gap Razorpay leaves open on Orders creation, and we respect its per-order ceiling as a funnel bound. |
-| **Vertex AI** | Both model jobs run here: the **decomposer** turns one sentence into a budgeted task tree (one call per branch), and the **trusted monitor** judges intent against cart. Billed to the project, so it is genuine Google Cloud consumption — unlike an AI Studio API key, which never touches the project at all. It also unlocks `gemini-3.5-flash`; AI Studio caps that model at **20 requests a day**, which is why this project ran on the weaker `flash-lite` for most of its life. |
-| **AI Studio** | The same models by API key when no project is configured. Free tier, 15 requests a minute, and metered entirely separately from GCP billing. |
-| **Firestore** | The cumulative-spend ledger and the counterparty record. Transactional, so 81 concurrent payers cannot race past one ceiling — and durable, because a reputation that resets on every deploy is not one. |
-| **Groq · OpenRouter · Cerebras · SambaNova** | A fallback chain behind Gemini, all OpenAI-compatible. Two of the four were down the day it was wired, which is the argument for a chain. |
+| **Amazon Bedrock** | Every model job: the **decomposer** turns one sentence into a budgeted task tree (one call per branch), the **critic** reviews the plan, and the **trusted monitor** judges intent against cart. Signed by the AWS credential chain rather than a shared API key — which matters most for the monitor, the component this design calls trusted. |
+| **Strands Agents SDK** | The agent runtime. Six agents per round — three shoppers, a chooser, a payer or broker pair, a reviewer — each holding only the tools its token permits. It was in this repository *before* the port as a second framework, kept to test whether enforcement was really separable from the reasoning layer. It was, which is why replacing the first framework changed no enforcement code. |
+| **Cedar** | The authorisation policy at `/pay`. Two forbid rules and a permit — deliberately only the rules that are *chosen*, never the ones cryptography already settles. Fails closed. |
+| **Amazon DynamoDB** | The cumulative-spend ledger, the counterparty record and the standing orders. The budget check and the decrement are **one conditional write**, so 81 concurrent payers cannot race past one ceiling — the window this project exists to close does not exist rather than being held shut. |
+| **Groq · OpenRouter · Cerebras · SambaNova** | A fallback chain behind Bedrock, all OpenAI-compatible. Two of the four were down the day it was wired, which is the argument for a chain. It also keeps a non-AWS path reachable, which is what lets the enforcement layer keep claiming to be provider-neutral. |
 | **Tavily** | `best` sourcing reads the real web instead of the bundled corpus. Results are datamarked at one boundary before any model sees them. |
 | **Biscuit** | Ed25519 append-only capability tokens. Attenuation needs no key, so an agent mints its own narrower children **offline, with no issuer round-trip.** |
 
-The two that are genuinely load-bearing are **Biscuit** and **Firestore**: the
+The two that are genuinely load-bearing are **Biscuit** and **DynamoDB**: the
 first makes authority narrowable without an issuer, the second makes cumulative
 spend hold across a tree of concurrent payers. Everything else is replaceable —
 the payment rail behind one adapter, the models behind a provider chain that
-already survives two of four being down.
+already survives two of four being down, and the agent framework behind a
+`ToolSurface` that has now survived being swapped once.
 
 ---
 
@@ -483,29 +566,40 @@ pocketchange/     the trusted layer — nothing here trusts the agent
   funnel.py         recursive decomposition + the seven bounds
   token.py          mint · attenuate · verify · depth_of
   gateway.py        21 routes, nine checks, fail-closed
-  ledger.py         two-phase reservations, Firestore or memory
+  ledger.py         two-phase reservations, DynamoDB or memory
+  bedrock.py        the model boundary — three tiers, one credential chain
+  cedar.py          evaluates policies/pay.cedar at the enforcement point
+  dynamo.py         one table, and the conditional write that guards it
   monitor.py        the second layer — allow · defer · escalate
   counterparties.py who we have paid, and how it went
   audit.py          hash-linked, append-only
 
+policies/         the authorisation policy, in Cedar. Read it first —
+                  it is the shortest complete statement of what is allowed.
+
 agent/            the untrusted layer — assumed compromised
+  runtime.py        how a node becomes a Strands agent
   search.py         the web, datamarked at one boundary
   nodes/            one module per agent
-  graph/            an earlier ADK design, superseded (see below)
+  graph/            an earlier fixed-pipeline design, superseded (see below)
 
-deploy/           Cloud Run: one script, one service, one URL
+deploy/           DynamoDB Local for a laptop; a SAM template that has
+                  never been deployed, and says so
 merchant/         a simulated world, including 4 adversarial pages
 frontend/         the console — five panes, live SSE
 eval/             funnel · monitor · vectors · latency
-tests/            378, all offline
+tests/            528, all offline
+PORTING.md        every file the AWS port touched, and why
 ```
 
 ### Files you can ignore
 
-- **`agent/graph/`, `agent/buyer.py` — ~3,100 lines, superseded.** The original
-  fixed seven-agent ADK pipeline. The funnel replaced it; the gateway imports
-  exactly three things from `agent/`. Kept because it is a real earlier design,
-  not because anything runs it.
+- **`agent/graph/`, `agent/buyer.py` — superseded.** The original fixed
+  seven-agent pipeline. The funnel replaced it; the gateway imports exactly
+  three things from `agent/`. Kept because it is a real earlier design, not
+  because anything runs it — though it was ported to Strands along with
+  everything else, since a dead path that no longer compiles is worse than
+  either keeping it or deleting it.
 - **`spike/biscuit_chain.py`** — day-one proof that delegation works. Historical.
 - **`frontend/dist/`, `node_modules/`** — build output, gitignored.
 
@@ -525,14 +619,14 @@ Stated here rather than discovered later — the same move AIP §7 makes.
   Every payment records `monitor_ran`, so a run that settled *without* judgement
   can never be mistaken for one that was judged and approved.
 - **Prompt injection has not been landed on a real model.** Measured: 0 of 4
-  AgentDojo shapes moved `gemini-3.5-flash-lite`. The defence is demonstrated
+  AgentDojo shapes moved the small model this ran on at the time. The defence is demonstrated
   against a scripted agent that complies completely — the worst case — but that
   makes it a specification test, not an attack demo.
 - **The counterparty identity is agent-supplied** and therefore misattributable.
   What cannot be forged is the *history* behind the name.
 - **A stalled run cannot be cancelled.** A blocked call in a daemon thread is not
   interruptible; a watchdog tells the console, it does not stop the work.
-- **The root key is a file on disk**, and on Cloud Run it is generated per
+- **The root key is a file on disk**, and in a container it is generated per
   instance and lost on restart — a silent revocation of every live mandate. It
   belongs in a KMS.
 - **The demo gate is not authentication.** One shared token, shipped in a public
@@ -553,7 +647,8 @@ a person had to remember.
 ```json
 {"bounds": 7, "sok": {"defended": 10, "total": 12},
  "verdicts": ["allow", "defer", "escalate"],
- "rail": "razorpay-test", "models": {"primary": "vertex", "fallbacks": [...]},
+ "rail": "razorpay-test", "models": {"primary": "bedrock", "region": "us-east-1",
+                                    "fallbacks": [...]},
  "live": {"payments": 8, "counterparties": 4, "with_concerns": 2,
           "chain_intact": true}}
 ```
@@ -594,4 +689,13 @@ build fails on PyO3 0.24.
 
 ## Licence
 
-Apache-2.0
+Apache-2.0. Full text in [`LICENSE`](LICENSE); authorship and the third-party
+work this design borrows from are recorded in [`NOTICE`](NOTICE).
+
+## The AWS port
+
+This project was originally built against a different cloud. Every file the move
+touched — and, more usefully, every decision that looks arbitrary until you know
+what was tried first — is written down in [`PORTING.md`](PORTING.md), including
+the two things the port got wrong before it got them right and the latent bug it
+uncovered on the way.
