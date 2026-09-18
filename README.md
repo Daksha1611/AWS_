@@ -6,7 +6,7 @@
 
 **You hand an agent pocket change, not your wallet.**
 
-[![tests](https://img.shields.io/badge/tests-528_passing-2f6b45)](#verify-every-claim-on-this-page)
+[![tests](https://img.shields.io/badge/tests-534_passing-2f6b45)](#verify-every-claim-on-this-page)
 [![offline](https://img.shields.io/badge/offline-no_credentials_needed-4a5a51)](#60-second-start)
 [![enforcement](https://img.shields.io/badge/enforcement-0.18_ms-2f6b45)](#what-it-costs)
 [![SoK](https://img.shields.io/badge/SoK_vectors-10%2F12_defended-2f6b45)](#the-threat-model)
@@ -57,7 +57,7 @@ clean clone.
 ```bash
 python3.12 -m venv .venv && .venv/bin/pip install -e ".[biscuit,agent,policy,dev]"
 
-.venv/bin/pytest                              # 528 tests, ~30s
+.venv/bin/pytest                              # 534 tests, ~30s
 .venv/bin/python scripts/demo_funnel.py       # 148 agents, 81 payments, one ceiling
 .venv/bin/python scripts/demo_injection.py    # a fully compromised agent, refused
 .venv/bin/python scripts/demo_trust.py        # the seller's reputation vs ours
@@ -588,7 +588,7 @@ deploy/           DynamoDB Local for a laptop; a SAM template that has
 merchant/         a simulated world, including 4 adversarial pages
 frontend/         the console — five panes, live SSE
 eval/             funnel · monitor · vectors · latency
-tests/            528, all offline
+tests/            534, all offline
 PORTING.md        every file the AWS port touched, and why
 ```
 
