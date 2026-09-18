@@ -134,15 +134,26 @@ def _standard_fleet() -> AgentRegistry:
 
 
 def _root_keypair():
-    """Persisted when a key directory is available, ephemeral otherwise.
+    """Three tiers, checked in order: ephemeral, Secrets Manager, disk.
 
-    Tests and throwaway runs get a fresh key; a real gateway keeps one, so a
-    restart is not a silent revocation of every outstanding mandate.
+    Tests and throwaway runs get a fresh key. A real gateway keeps one - but
+    "keeps one" means something different depending on what is under it.
+    `secrets.py` wins when it is configured because a container's disk is not
+    shared across instances or across a redeploy, and a key that is not
+    identical everywhere is indistinguishable from forgery to whichever
+    instance did not mint it. `keys.py` is the laptop fallback: right for one
+    process, one disk, no scaling.
     """
     from biscuit_auth import KeyPair
 
     if os.getenv("POCKETCHANGE_EPHEMERAL_KEYS") == "1":
         return KeyPair()
+
+    from . import secrets
+
+    if secrets.configured():
+        return secrets.load_or_create()
+
     from . import keys
 
     try:

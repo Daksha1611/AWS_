@@ -44,10 +44,15 @@ def no_cloud(monkeypatch):
     suite quietly went back on the network.
 
     POCKETCHANGE_NO_BEDROCK is the switch that actually closes it, checked
-    before boto3 is consulted at all.
+    before boto3 is consulted at all. POCKETCHANGE_NO_SECRETS_MANAGER is the
+    same switch for secrets.py, added when the root key gained a third tier -
+    without it, a suite run on a machine with both AWS credentials and
+    POCKETCHANGE_KEY_SECRET_NAME set in its shell profile would quietly start
+    minting or fetching a real key on every test.
     """
     monkeypatch.setenv("POCKETCHANGE_NO_BEDROCK", "1")
     monkeypatch.setenv("POCKETCHANGE_NO_DYNAMODB", "1")
+    monkeypatch.setenv("POCKETCHANGE_NO_SECRETS_MANAGER", "1")
     for name in (
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
