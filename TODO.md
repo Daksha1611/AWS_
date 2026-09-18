@@ -243,10 +243,11 @@ Already written up in `PORTING.md` §5 and `HACKATHON.md`. The short list:
       the end of the test that spawned it. Measured ~1 failure in 5 full runs
       before, ~1 in 33 after; still not provably zero, so leaving this line
       rather than closing it silently.
-- [ ] `/replay` reports `charged_twice` by diffing the mandate's whole committed
-      total, so it cannot tell "this replay charged again" from "something else
-      settled while I was looking". The test works around it; the endpoint still
-      has it.
+- [x] `/replay` reported `charged_twice` by diffing the mandate's whole
+      committed total, so it could not tell "this replay charged again" from
+      "something else settled while I was looking". Fixed: it now reads
+      `response.replayed` from the same `pay()` call, which is set inside the
+      idempotency check that decides whether a new reservation opens at all.
 - [ ] `scripts/demo_standing.py` needs a real model. Every other demo runs
       offline; the README should say which is which.
 - [ ] Prompt injection is demonstrated against a scripted worst-case agent, not
