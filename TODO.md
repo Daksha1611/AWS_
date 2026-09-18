@@ -232,12 +232,17 @@ perhaps twenty. Practical advice anyway:
 
 Already written up in `PORTING.md` §5 and `HACKATHON.md`. The short list:
 
-- [ ] **A flake, ~1 run in 5.** `test_t2t_a_fabricated_price_cannot_enter_a_cart`
-      fails with `KeyError: 'token'` — its `POST /delegate` came back without
-      one. Passes in isolation, predates the port. Likely a background run from
-      an earlier test still writing to the module-global `gateway.state` the
-      next test has replaced. **~1 hour**; the fix is probably for the gateway
-      tests to join their threads.
+- [x] **A flake, ~1 run in 5.** Confirmed: a `POST /runs` test's daemon thread
+      kept running past its own test and into whichever test collected next,
+      writing to the `gateway.state` that test had already replaced - it
+      surfaced as a different assertion on different runs (`KeyError: 'token'`
+      in `test_t2t_a_fabricated_price_cannot_enter_a_cart`, `KeyError:
+      'approval_id'` in `test_repurchase.py`, a stray 403 in
+      `test_repurchase.py` again), not always the one name this file had. Fixed
+      by an autouse fixture in `conftest.py` that joins every `run-*` thread at
+      the end of the test that spawned it. Measured ~1 failure in 5 full runs
+      before, ~1 in 33 after; still not provably zero, so leaving this line
+      rather than closing it silently.
 - [ ] `/replay` reports `charged_twice` by diffing the mandate's whole committed
       total, so it cannot tell "this replay charged again" from "something else
       settled while I was looking". The test works around it; the endpoint still

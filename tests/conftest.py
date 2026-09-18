@@ -71,3 +71,40 @@ def no_cloud(monkeypatch):
         "TAVILY_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def join_run_threads():
+    """`POST /runs` answers before its funnel finishes - the work continues on
+    a daemon thread named `run-<mandate id, short>` (gateway.py). A test that
+    hits `/runs` and moves on without waiting leaves that thread running into
+    whichever test collects next, where it goes on writing to
+    `gateway.state` well after that test's `client` fixture has already
+    replaced it with a fresh one.
+
+    That is the actual cause of the flake TODO.md describes against
+    test_t2t_a_fabricated_price_cannot_enter_a_cart - it never calls /runs
+    itself; an earlier test's still-running funnel does, mutating state out
+    from under whatever runs next. It is not that one test either: the same
+    leak surfaces as whatever assertion the *next* test happens to make, which
+    is why it reproduces as a different failure on a different run rather
+    than the same one every fifth time.
+
+    A timeout well under RUN_DEADLINE_SECONDS - every funnel exercised in this
+    suite runs the deterministic decomposer against a small tree and finishes
+    in well under a second; a thread that is still alive after 10s is not
+    "the demo running slowly", it is a bug worth a loud failure rather than a
+    join() that returns silently anyway.
+    """
+    yield
+    import threading
+
+    current = threading.current_thread()
+    for thread in threading.enumerate():
+        if thread is current or not thread.name.startswith("run-"):
+            continue
+        thread.join(timeout=10)
+        assert not thread.is_alive(), (
+            f"{thread.name} outlived its test - it would go on mutating "
+            "gateway.state after the next test replaces it"
+        )
