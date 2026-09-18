@@ -58,18 +58,20 @@ def is_enabled() -> bool:
     return _client() is not None
 
 
-def instrument_adk() -> bool:
-    """Attach the ADK instrumentor if it is installed.
+def instrument_agents() -> bool:
+    """Turn on the agent SDK's own telemetry if it is installed.
 
-    ADK already emits OpenTelemetry GenAI semantic conventions, so every tool
-    call and model completion becomes a span without bespoke code.
+    Strands emits OpenTelemetry GenAI semantic conventions itself, so every tool
+    call and model completion becomes a span without bespoke code - the same
+    bargain the previous framework's instrumentor offered, with one less package
+    in between.
     """
     if not is_enabled():
         return False
     try:
-        from openinference.instrumentation.google_adk import GoogleADKInstrumentor
+        from strands.telemetry import StrandsTelemetry
 
-        GoogleADKInstrumentor().instrument()
+        StrandsTelemetry().setup_otlp_exporter()
         return True
     except Exception:  # noqa: BLE001
         return False

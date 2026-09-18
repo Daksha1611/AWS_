@@ -144,17 +144,36 @@ def test_next_round_clears_stale_proposals(tools):
 
 
 def test_graph_shape(tools):
-    buyer = build_buyer(tools, model="gemini-3.5-flash-lite")
-    assert [a.name for a in buyer.sub_agents] == ["market", "chooser", "payer", "reviewer"]
-    assert len(buyer.sub_agents[0].sub_agents) == 3
+    buyer = build_buyer(tools, model="anthropic.claude-haiku-4-5")
+    assert [s.name for s in buyer.stages] == ["market", "chooser", "payer", "reviewer"]
+    assert len(buyer.stages[0].agents) == 3
     assert buyer.max_iterations == MAX_ROUNDS
 
 
-def test_every_agent_gets_its_own_quota(tools):
-    """Six agents on one model name queue behind one free-tier bucket."""
+def test_only_the_market_stage_runs_concurrently(tools):
+    """The fan-out is the one place order does not matter.
+
+    Everything after it is a decision that depends on the step before: the
+    chooser needs the proposals, the payer needs the adopted cart, the reviewer
+    needs the outcome. Running any of those in parallel would be a race, not a
+    speed-up.
+    """
+    buyer = build_buyer(tools, model="anthropic.claude-haiku-4-5")
+    assert [s.name for s in buyer.stages if s.parallel] == ["market"]
+
+
+def test_every_agent_draws_on_the_same_model(tools):
+    """The inverse of what this test used to assert, and deliberately so.
+
+    On the previous provider quota was metered per model *name*, so three
+    shoppers sharing one name queued behind one bucket and the fix was to hand
+    each a different name. Bedrock meters per account and region, so spreading
+    across models of unequal capability would buy nothing and cost consistency.
+    See PORTING.md D3.
+    """
     buyer = build_buyer(tools)
-    names = [getattr(a.model, "model", a.model) for a in buyer.sub_agents[0].sub_agents]
-    assert len(set(names)) == 3
+    ids = [a.model.config["model_id"] for a in buyer.stages[0].agents]
+    assert len(set(ids)) == 1
 
 
 def test_shoppers_cannot_pay_and_payer_cannot_browse(tools):

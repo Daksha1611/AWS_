@@ -39,7 +39,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request as _Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import config, counterparties, events, funnel as funnels, identity, intake, providers, token
+from . import bedrock, cedar, config, counterparties, events, funnel as funnels
+from . import identity, intake, providers, token
 from . import memory as memory_bank
 from .approvals import AlreadyResolved, ApprovalStore, UnknownApproval
 from .audit import AuditLog, AuditTampered, Decision
@@ -89,7 +90,7 @@ class State:
             "pocketchange.dev", "principal", keypair=_root_keypair()
         )
         self.root_public_key = token.root_key_from(self.principal.private_key)
-        # Firestore when GOOGLE_CLOUD_PROJECT is set, in-memory otherwise.
+        # DynamoDB when one is configured, in-memory otherwise.
         # Tests and local work must never need cloud credentials.
         self.ledger = ledger_from_env()
         self.replays = ReplayStore()
@@ -99,7 +100,7 @@ class State:
         self.intents: dict[str, str] = {}   # mandate id -> what the human authorised
         self.approvals = ApprovalStore()
         self.registry = _standard_fleet()
-        # Who we have actually paid. Firestore when configured, so the record
+        # Who we have actually paid. DynamoDB when configured, so the record
         # outlives a restart - a reputation that resets every deploy is not one.
         self.counterparties = counterparties.from_env()
         self.memory = memory_bank.from_env()
@@ -153,7 +154,7 @@ def _root_keypair():
 
 
 # Read .env BEFORE the state is built. Everything that decides whether this
-# gateway is live - the Razorpay rail, the Firestore ledger, the Gemini monitor -
+# gateway is live - the Razorpay rail, the durable ledger, the monitor -
 # reads os.environ inside State(), and until now nothing loaded the file. The
 # effect was quiet and total: a fully configured project still reported
 # {"rail": "fake"} because the keys were on disk and never in the process.
@@ -421,6 +422,16 @@ def _depth(bearer, claimed: int | None, *, mid: str, tool: str, context: str) ->
     return derived
 
 
+def _role(bearer) -> str:
+    """The principal's role, as the authorisation policy names it.
+
+    Derived from the token chain, never from the request body. A role the caller
+    could assert is not a role - it is a request, and this one decides whether
+    the money moves.
+    """
+    return "broker" if token.is_broker(bearer) else "payer"
+
+
 def _mount_console() -> None:
     """Serve the built console from this same service, if it has been built.
 
@@ -539,17 +550,17 @@ def _choose_decomposer(req: RunRequest, bounds: funnels.Bounds):
     not.
     """
     wanted = req.decomposer
-    have_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"))
+    have_key = have_model()
 
     if wanted == "departmental" or (wanted == "auto" and not have_key):
         return _departmental(req.fan_out), "departmental (deterministic, no model)"
 
     if wanted == "model" and not have_key:
-        raise HTTPException(400, "decomposer=model needs GOOGLE_API_KEY or GEMINI_API_KEY")
+        raise HTTPException(400, "decomposer=model needs AWS credentials for Bedrock")
 
     from agent.nodes.decompose_node import make_decomposer
 
-    return make_decomposer(bounds), "model (gemini, one call per branch)"
+    return make_decomposer(bounds), "model (bedrock, one call per branch)"
 
 
 def _expected_model_calls(req: RunRequest, using_model: bool) -> int:
@@ -605,9 +616,7 @@ def _extractor():
     question instead of only the missing ones, which is a worse front door and a
     working one.
     """
-    have_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-                    or os.environ.get("GOOGLE_CLOUD_PROJECT"))
-    if not have_key:
+    if not have_model():
         return None
     try:
         from agent.nodes.intake_node import intake_chain
@@ -636,8 +645,7 @@ def read_request(req: IntakeRequest) -> dict[str, Any]:
         # Say what the run will cost before it is started, not after. The same
         # figure /runs returns, computed from the same function.
         proposal = RunRequest(**reading.proposal)
-        have_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"))
-        using_model = proposal.decomposer != "departmental" and have_key
+        using_model = proposal.decomposer != "departmental" and have_model()
         payload["expected_model_calls"] = _expected_model_calls(
             proposal, using_model=using_model)
         payload["model_calls_exact"] = not using_model
@@ -745,9 +753,9 @@ def start_run(req: RunRequest) -> dict[str, Any]:
         # is a layer that does not exist in this deployment. Reporting either as
         # a plain false let the console print "critic on" over a run no critic
         # ever read, and a ticked monitor box over payments nothing judged.
-        "critic": ("gemini" if critic
+        "critic": ("bedrock" if critic
                    else "off" if not req.critic else "unconfigured"),
-        "monitor": ("gemini" if (req.monitor and monitor_judges(state.monitor))
+        "monitor": ("bedrock" if (req.monitor and monitor_judges(state.monitor))
                     else "off" if not req.monitor else "unconfigured"),
         "capabilities": capabilities(),
         "expected_model_calls": _expected_model_calls(
@@ -765,9 +773,7 @@ def _make_critic(req: "RunRequest"):
     second opinion, and a run must never fail to start because one is
     unavailable.
     """
-    have_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-                    or os.environ.get("GOOGLE_CLOUD_PROJECT"))
-    if not have_key:
+    if not have_model():
         return None
     try:
         from agent.nodes.critic_node import make_critic
@@ -910,16 +916,20 @@ def publish_event(req: EventIn) -> dict[str, Any]:
     return {"published": True, "at": event.at.isoformat()}
 
 
-# Two paths, one handler. Google's edge intercepts /healthz on Cloud Run and
-# answers it with its own 404 before the request reaches the container - the
-# giveaway is a response carrying neither `server: Google Frontend` nor a trace
-# header, unlike every route that does arrive. /status is the one to use on a
-# deployment; /healthz stays for local runs and anything expecting that name.
+# Two paths, one handler. A managed edge may intercept /healthz and answer it
+# with its own 404 before the request reaches the container - the giveaway is a
+# response carrying no trace header, unlike every route that does arrive.
+# /status is the one to use on a deployment; /healthz stays for local runs and
+# anything expecting that name.
 def have_model() -> bool:
-    """Is there any model this process can actually reach?"""
-    return bool(os.environ.get("GOOGLE_API_KEY")
-                or os.environ.get("GEMINI_API_KEY")
-                or os.environ.get("GOOGLE_CLOUD_PROJECT"))
+    """Is there any model this process can actually reach?
+
+    One definition, called from five places that each used to inline their own
+    environment check. They drifted: two looked for a project id and two did
+    not, so the same process could report a model on /status and refuse to use
+    one on /runs.
+    """
+    return bedrock.available()
 
 
 def capabilities() -> dict[str, Any]:
@@ -943,8 +953,8 @@ def capabilities() -> dict[str, Any]:
         "payments_are_real": False,          # test mode, always. Never live keys.
         "model": model,
         "decomposer": "model" if model else "departmental",
-        "monitor": "gemini" if monitor_judges(state.monitor) else "unconfigured",
-        "critic": "gemini" if model else "unconfigured",
+        "monitor": "bedrock" if monitor_judges(state.monitor) else "unconfigured",
+        "critic": "bedrock" if model else "unconfigured",
         "search": bool(os.environ.get("TAVILY_API_KEY")),
         # One sentence a console can print without having to reason about the
         # combination itself.
@@ -1162,16 +1172,22 @@ def pay(
     except token.Denied as exc:
         raise deny(str(exc), 403) from exc
 
-    # 4b. broker separation - policy, not cryptography.
+    # 4b. the rules we chose, as opposed to the ones we proved.
     #
-    # A broker must be able to confer `pay` on its sub-payers, and attenuation is
+    # Everything above this line is a cryptographic guarantee: the signature, the
+    # chain, the scope, the expiry, the depth. What follows is policy - decisions
+    # someone made about who may do what - and it lives in policies/pay.cedar so
+    # that it can be read without reading this function.
+    #
+    # The rule that used to be written here is the broker separation. A broker
+    # must be able to confer `pay` on its sub-payers, and attenuation is
     # monotonic, so its own chain necessarily permits `pay` too. The token cannot
-    # express "may grant but not spend", so the enforcement point does. Said
-    # plainly because the distinction matters: the per-seller caps below are a
-    # cryptographic guarantee; this line is a rule we chose to apply here.
-    if token.is_broker(bearer):
-        raise deny("a broker may delegate, not spend", 403,
-                   {"delegate": token.terminal_delegate(bearer)})
+    # express "may grant but not spend", so the enforcement point does.
+    refusal = cedar.decide(action="pay", role=_role(bearer), mandate_id=mid)
+    if refusal is not None:
+        raise deny(refusal.reason, refusal.status,
+                   {"policy": refusal.policy_id,
+                    "delegate": token.terminal_delegate(bearer)})
 
     # 5. reserve - cumulative spend and idempotency, in one lock
     #
@@ -1517,10 +1533,15 @@ def payout(request: Request, req: Annotated[PayoutRequest, Body()]) -> dict[str,
     except token.Denied as exc:
         raise deny("scope never granted: no block in this chain permits payout", 403) from exc
 
-    # Unreachable with any token this gateway mints, but written closed rather
-    # than left to fall through - a path that cannot happen today is exactly the
-    # path that happens after someone widens a scope next month.
-    raise deny("payout is not enabled on this deployment", 501)
+    # Unreachable with any token this gateway mints, because none carries
+    # `tool:payout` in scope and step 4 has just refused it. Kept, and moved into
+    # the policy file, because a path that cannot happen today is exactly the
+    # path that happens after someone widens a scope next month - and when that
+    # day comes, the switch should be somewhere a person would look.
+    refusal = cedar.decide(action="payout", role=_role(bearer), mandate_id=mid)
+    if refusal is not None:
+        raise deny(refusal.reason, refusal.status)
+    raise deny("payout reached the end of the money path without settling", 500)
 
 
 class ApprovalDecision(BaseModel):
@@ -1861,7 +1882,8 @@ def facts() -> dict[str, Any]:
         "verdicts": [v.value for v in Verdict],
         "rail": "razorpay-test" if not isinstance(state.rail, FakeRail) else "fake",
         "models": {
-            "primary": "vertex" if providers.vertex_available() else "aistudio",
+            "primary": "bedrock" if bedrock.available() else "none",
+            "region": bedrock.region(),
             "fallbacks": [p.name for p in providers.configured()],
         },
         "live": live,

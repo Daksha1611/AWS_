@@ -2,18 +2,24 @@
 
 Nothing in the gateway process called `load()`, so `.env` was never read, and
 every component that decides whether the system is real - the Razorpay rail, the
-Firestore ledger, the Gemini monitor - read an empty environment and silently
-chose its stub. A fully configured project reported `{"rail": "fake"}` for days.
+durable ledger, the monitor - read an empty environment and silently chose its
+stub. A fully configured project reported `{"rail": "fake"}` for days.
 
 The lesson these tests encode: a configuration layer that fails by returning
 plausible defaults needs its *reporting* tested, not just its parsing.
+
+The port deleted one whole class of test from this file. The previous provider
+issued keys under two names that were not interchangeable, so `load()` had to
+know which was likelier to work and mirror it into the other - and that
+mirroring needed asserting, because every model call in the project depended on
+it. Bedrock has no key to mirror.
 """
 
 import pytest
 
 from pocketchange import config
 
-KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET",
+KEYS = ("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET",
         "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY")
 
 
@@ -36,12 +42,12 @@ def test_the_offline_guard_stops_it_reading_anything(monkeypatch, tmp_path):
     for k in KEYS:
         monkeypatch.delenv(k, raising=False)
     env = tmp_path / ".env"
-    env.write_text("GEMINI_API_KEY=would-reach-the-network\n")
+    env.write_text("RAZORPAY_KEY_ID=would-reach-the-network\n")
 
-    assert config.load(env) == {"gemini": False, "razorpay": False, "langfuse": False}
+    assert config.load(env) == {"bedrock": False, "razorpay": False, "langfuse": False}
     import os
 
-    assert "GOOGLE_API_KEY" not in os.environ
+    assert "RAZORPAY_KEY_ID" not in os.environ
 
 
 def write(path, **pairs):
@@ -53,13 +59,16 @@ def write(path, **pairs):
 
 
 def test_an_absent_file_reports_everything_missing(clean):
-    assert config.load(clean) == {"gemini": False, "razorpay": False, "langfuse": False}
+    assert config.load(clean) == {"bedrock": False, "razorpay": False, "langfuse": False}
 
 
 def test_a_populated_file_reports_everything_present(clean):
-    write(clean, GEMINI_API_KEY="g", RAZORPAY_KEY_ID="rzp_test_x",
+    write(clean, RAZORPAY_KEY_ID="rzp_test_x",
           RAZORPAY_KEY_SECRET="s", LANGFUSE_PUBLIC_KEY="p", LANGFUSE_SECRET_KEY="q")
-    assert config.load(clean) == {"gemini": True, "razorpay": True, "langfuse": True}
+    status = config.load(clean)
+    # bedrock is absent by design here: conftest closes it off for the whole
+    # suite, and it is not a key that can be written into a .env file anyway.
+    assert status == {"bedrock": False, "razorpay": True, "langfuse": True}
 
 
 def test_half_a_credential_pair_is_not_configured(clean):
@@ -73,14 +82,16 @@ def test_half_a_credential_pair_is_not_configured(clean):
 # --- the mirroring that everything downstream depends on -------------------
 
 
-def test_gemini_key_is_mirrored_into_google_api_key(clean, monkeypatch):
-    """ADK and google-genai both reach for GOOGLE_API_KEY. Every model call in
-    this project would fail with only GEMINI_API_KEY set."""
-    import os
+def test_the_model_is_reported_from_the_credential_chain_not_a_key(clean):
+    """There is no model key to load, and that is the point.
 
-    write(clean, GEMINI_API_KEY="the-key")
-    config.load(clean)
-    assert os.environ["GOOGLE_API_KEY"] == "the-key"
+    `.env` cannot make Bedrock available and must not appear to: boto3 resolves
+    a role or profile on its own. A .env full of plausible-looking model
+    credentials has to leave `bedrock` false rather than reporting a model this
+    process cannot actually reach.
+    """
+    write(clean, AWS_ACCESS_KEY_ID="looks-real", POCKETCHANGE_BEDROCK_MODEL="x")
+    assert config.load(clean)["bedrock"] is False
 
 
 def test_loading_actually_puts_values_in_the_environment(clean, monkeypatch):
@@ -110,12 +121,12 @@ def test_the_fallback_parser_handles_quotes_comments_and_blanks(clean, monkeypat
 
 
 def test_nothing_it_returns_or_prints_contains_a_secret(clean):
-    write(clean, GEMINI_API_KEY="SUPER-SECRET-VALUE",
-          RAZORPAY_KEY_ID="rzp_test_SECRET", RAZORPAY_KEY_SECRET="ALSO-SECRET")
+    write(clean, RAZORPAY_KEY_ID="rzp_test_SECRET", RAZORPAY_KEY_SECRET="ALSO-SECRET",
+          LANGFUSE_PUBLIC_KEY="SUPER-SECRET-VALUE", LANGFUSE_SECRET_KEY="q")
     status = config.load(clean)
     assert set(status.values()) <= {True, False}
 
     line = config.report()
     for secret in ("SUPER-SECRET-VALUE", "rzp_test_SECRET", "ALSO-SECRET"):
         assert secret not in line
-    assert "gemini:yes" in line
+    assert "razorpay:yes" in line

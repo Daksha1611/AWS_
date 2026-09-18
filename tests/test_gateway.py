@@ -440,6 +440,28 @@ def _wait_for(predicate, tries=60, pause=0.05):
     return False
 
 
+def _wait_until_quiet(read, tries=60, pause=0.05):
+    """Block until `read()` returns the same value twice running.
+
+    A run keeps settling after its first payment, and several assertions here
+    compare a mandate's committed total before and after some action. Reading
+    that total while the run is still working makes a concurrent settlement look
+    like the action charged - which is exactly the flake this replaced: the
+    replay test failed about one run in four, always by reporting a second
+    charge that never happened.
+    """
+    import time
+
+    previous = object()
+    for _ in range(tries):
+        current = read()
+        if current == previous:
+            return current
+        previous = current
+        time.sleep(pause)
+    return previous
+
+
 def test_a_run_mints_a_mandate_and_builds_a_real_tree(client, monkeypatch):
     from pocketchange import events as ev
 
@@ -545,6 +567,12 @@ def test_replay_returns_the_same_order_and_does_not_charge_twice(client, monkeyp
         "fan_out": 3, "floor_paise": 11_000 * RUPEE, "decomposer": "departmental",
     }).json()
     assert _wait_for(lambda: any(e.kind == ev.SETTLED for e in ev.bus.history()))
+    # The run is not finished when its first payment settles. /replay reports
+    # `charged_twice` by comparing the mandate's whole committed total, so a
+    # sibling payment landing between the two reads is indistinguishable from
+    # this replay charging again.
+    _wait_until_quiet(
+        lambda: gateway.state.ledger.state(body["mandate_id"]).committed_paise)
 
     paid = [e for e in gateway.state.audit.entries()
             if e.tool == "pay" and e.decision is Decision.ALLOWED]
@@ -563,7 +591,7 @@ def test_replay_of_an_unknown_entry_is_a_404(client):
 
 
 def test_a_run_reports_which_decomposer_ran(client, monkeypatch):
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("POCKETCHANGE_NO_BEDROCK", "1")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     body = client.post("/runs", json={
         "task": "anything", "budget_paise": 50_000 * RUPEE, "decomposer": "auto",
@@ -1011,9 +1039,9 @@ def test_status_names_an_unjudged_deployment_as_degraded(client, monkeypatch):
     from pocketchange import gateway
     from pocketchange.monitor import from_env
 
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("POCKETCHANGE_NO_BEDROCK", "1")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setenv("POCKETCHANGE_NO_DYNAMODB", "1")
     gateway.state.monitor = from_env()
 
     can = client.get("/status").json()["capabilities"]

@@ -312,7 +312,7 @@ function drawLatency() {
   const overNetwork = me !== null && me > 50
   $('latency').innerHTML =
     row('Enforcement', me, overNetwork
-      ? 'includes a Firestore round trip; 0.164 ms with the in-memory ledger'
+      ? 'includes a DynamoDB round trip; 0.164 ms with the in-memory ledger'
       : 'signature, expiry, depth, scope, cumulative spend, idempotency') +
     row('Judgement', mj, jud.length ? `${jud.length} model call${jud.length === 1 ? '' : 's'}`
                                     : 'monitor not run') +
@@ -646,7 +646,7 @@ function showCapabilities() {
   const box = $('opt-monitor')
   if (!can) { banner.hidden = true; return }
 
-  const judging = can.monitor === 'gemini'
+  const judging = can.monitor === 'bedrock'
   box.disabled = !judging
   box.checked = box.checked && judging
   const label = box.closest('.opt')
@@ -704,9 +704,9 @@ async function startRun(proposal) {
     // Three states, not two: a layer that is watching, one someone switched
     // off, and one this deployment does not have. Collapsing the last two into
     // "off" was the smaller half of the same dishonesty as the monitor's.
-    state.criticOn = started.critic === 'gemini' ? true
+    state.criticOn = started.critic === 'bedrock' ? true
       : started.critic === 'unconfigured' ? null : false
-    const layer = (name, value) => value === 'gemini' ? `${name} on`
+    const layer = (name, value) => value === 'bedrock' ? `${name} on`
       : value === 'off' ? `${name} off` : `no ${name} configured`
     $('head-note').textContent =
       `${started.decomposer} · ${layer('critic', started.critic)} · ` +

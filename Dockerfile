@@ -27,8 +27,8 @@ ENV PYTHONUNBUFFERED=1 \
     # live mandate. Generating one per instance is the honest behaviour, and it
     # is why the limitations say this belongs in a KMS.
     POCKETCHANGE_EPHEMERAL_KEYS=1 \
-    # .env is not shipped. Cloud Run injects real environment variables, and a
-    # dotenv file baked into an image is a credential in a registry.
+    # .env is not shipped. A deployment injects real environment variables, and
+    # a dotenv file baked into an image is a credential in a registry.
     POCKETCHANGE_NO_DOTENV=1
 
 WORKDIR /app
@@ -38,15 +38,21 @@ COPY pocketchange/ ./pocketchange/
 COPY agent/ ./agent/
 COPY merchant/ ./merchant/
 COPY eval/ ./eval/
+# The Cedar policy set, and not optional. `cedar.decide` fails CLOSED when it
+# cannot read a policy - which is the correct behaviour for the only rule
+# standing between a broker and the money, and means an image built without this
+# line answers 503 to every payment.
+COPY policies/ ./policies/
 
-RUN pip install --no-cache-dir -e ".[biscuit,gcp,agent]"
+RUN pip install --no-cache-dir -e ".[biscuit,agent,policy]"
 
 COPY --from=console /console/dist ./frontend/dist
 
 RUN useradd --create-home --uid 1001 runner && chown -R runner:runner /app
 USER runner
 
-# Cloud Run sets $PORT and will not always use 8080.
+# Read from the environment rather than hardcoded: most container runtimes
+# choose the port and will not always choose 8080.
 ENV PORT=8080
 EXPOSE 8080
 CMD exec uvicorn pocketchange.gateway:app --host 0.0.0.0 --port ${PORT} --workers 1

@@ -155,22 +155,28 @@ routine purchases makes the system useless.
 """
 
 
-class GeminiMonitor:
-    """The real monitor. A small, fast, trusted model with no tools."""
+class BedrockMonitor:
+    """The real monitor. A small, fast, trusted model with no tools.
+
+    Small deliberately. This is the trusted component of an AI-control
+    arrangement and it answers one narrow question, so it runs on the cheapest
+    tier Bedrock serves rather than the model the buyer reasons with. A trusted
+    layer should be simple enough to reason about.
+    """
 
     judges = True
 
     def __init__(self, model: str | None = None, timeout: float = 10.0) -> None:
-        from . import config
+        from . import bedrock
 
-        self.model = model or config.resolve_model(
-            config.MONITOR_MODELS, override_env="POCKETCHANGE_MONITOR_MODEL"
+        self.model = (
+            model
+            or os.getenv("POCKETCHANGE_MONITOR_MODEL", "").strip()
+            or bedrock.JUDGE_MODEL
         )
         self.timeout = timeout
 
     def judge(self, situation: Situation) -> Judgement:
-        from google import genai
-
         prompt = PROMPT.format(
             intent=situation.intent,
             tool=situation.tool,
@@ -184,11 +190,11 @@ class GeminiMonitor:
             committed_paise=situation.committed_paise,
         )
         try:
-            from . import providers
+            from . import bedrock
 
-            client, model, _flavour = providers.gemini_client(self.model, tier="judge")
-            response = client.models.generate_content(model=model, contents=prompt)
-            return _parse(response.text)
+            return _parse(
+                bedrock.text(prompt, model=self.model, max_tokens=400)
+            )
         except Exception as exc:  # noqa: BLE001
             # Before failing open, ask somewhere else.
             #
@@ -272,14 +278,16 @@ def judges(monitor: Monitor) -> bool:
 
 
 def from_env() -> Monitor:
-    """The real monitor if a key is present, otherwise one that always allows.
+    """The real monitor if Bedrock is reachable, otherwise one that always allows.
 
     Allowing rather than escalating when unconfigured keeps the deterministic
     layer's behaviour unchanged - the monitor adds a check, it never becomes a
     prerequisite.
     """
-    if os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_CLOUD_PROJECT"):
-        return GeminiMonitor()
+    from . import bedrock
+
+    if bedrock.available():
+        return BedrockMonitor()
     # judges=False, so the audit says "not judged" rather than recording this as
     # an approval the monitor issued. See JUDGES above.
     return ScriptedMonitor(Verdict.ALLOW, "monitor not configured", judges=False)

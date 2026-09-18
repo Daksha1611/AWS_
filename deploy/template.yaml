@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+# Pocket Change on AWS.
+#
+# HONEST STATUS: this template has never been deployed. The project runs
+# locally - that is the track it is entered in - and this exists because the
+# table layout, the IAM scoping and the model access are things a reader should
+# be able to see stated, not because a stack was created from it. Treat it as a
+# design document that happens to be executable. `sam validate` has not been run
+# against it either; there is no SAM CLI on the machine it was written on.
+#
+# Deploying it would need the checklist in deploy/README.md.
+
+Description: >
+  Bounded, revocable spending authority for AI agents - gateway, ledger table,
+  and the IAM scoping that makes "bounded" true of the infrastructure as well as
+  the tokens.
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-opus-5
+    Description: The buyer's reasoning model.
+  BedrockJudgeModelId:
+    Type: String
+    Default: anthropic.claude-haiku-4-5
+    Description: >
+      The monitor. Deliberately the smallest tier: it is the trusted component
+      of an AI-control arrangement and answers one narrow question.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 1024
+    Environment:
+      Variables:
+        POCKETCHANGE_DDB_TABLE: !Ref LedgerTable
+        POCKETCHANGE_BEDROCK_MODEL: !Ref BedrockModelId
+        POCKETCHANGE_BEDROCK_JUDGE_MODEL: !Ref BedrockJudgeModelId
+        # A dotenv file baked into a deployment artefact is a credential in a
+        # registry. Everything here arrives as a real environment variable.
+        POCKETCHANGE_NO_DOTENV: '1'
+
+Resources:
+
+  # One table, composite key. See pocketchange/dynamo.py for the item layout and
+  # why `available_paise` is stored rather than derived.
+  LedgerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        # This is a ledger. The cost of being able to answer "what did it say
+        # last Tuesday" is far below the cost of not being able to.
+        PointInTimeRecoveryEnabled: true
+
+  GatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../
+      Handler: pocketchange.lambda_handler.handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LedgerTable
+        # Scoped to the two model ids this project actually calls, rather than
+        # `bedrock:InvokeModel` on `*`. The whole subject of this project is
+        # authority that is bounded rather than merely intended to be, and a
+        # wildcard here while the README argues otherwise would be funny in the
+        # wrong way.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockJudgeModelId}
+
+Outputs:
+  GatewayUrl:
+    Description: Base URL of the gateway.
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  LedgerTableName:
+    Description: The DynamoDB table holding mandates, reservations and the book.
+    Value: !Ref LedgerTable

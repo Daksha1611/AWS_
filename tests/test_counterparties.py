@@ -66,7 +66,7 @@ def test_a_nameless_counterparty_is_refused(book):
 
 
 def test_without_a_project_it_stays_in_memory(monkeypatch):
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setenv("POCKETCHANGE_NO_DYNAMODB", "1")
     assert isinstance(from_env(), InMemoryCounterparties)
 
 

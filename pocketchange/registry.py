@@ -93,7 +93,7 @@ class AgentCard:
 
 
 class AgentRegistry:
-    """Publish, version, discover. In-process, shaped so Firestore can replace it."""
+    """Publish, version, discover. In-process, shaped so DynamoDB can replace it."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

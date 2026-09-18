@@ -1,9 +1,18 @@
-"""Somewhere else to ask when the first model will not answer.
+"""Somewhere else to ask when Bedrock will not answer.
 
-Gemini's free tier is 15 requests a minute, and that has been the binding
-constraint on this project throughout - not correctness, not design, quota. A
-demo that dies mid-judging because a decomposition hit a 429 is a demo that
-failed for the least interesting possible reason.
+This began as an answer to a free tier of 15 requests a minute, which was the
+binding constraint on the project before the move to Bedrock - not correctness,
+not design, quota. A demo that dies mid-judging because a decomposition hit a
+429 is a demo that failed for the least interesting possible reason.
+
+Bedrock removes the quota cliff, so the honest question is why this file
+survives the port at all. Two reasons. A throttle is still a throttle, and the
+monitor fails OPEN when it cannot reach a model - so the window in which the
+second layer silently stops existing is worth narrowing with something that
+does not share Bedrock's failure modes. And keeping a non-AWS path reachable is
+what lets the project keep claiming the enforcement layer is provider-neutral:
+the claim is cheap to make and expensive to verify once the alternative is
+deleted.
 
 So this is a chain, not a spare. Measured while writing it, with real keys:
 
@@ -66,59 +75,6 @@ FALLBACKS: tuple[Provider, ...] = (
 
 class NoProviderAnswered(Exception):
     """Every configured provider refused, timed out, or is not configured."""
-
-
-# --- Gemini: two doors to the same models ------------------------------------
-#
-# AI Studio (generativelanguage.googleapis.com) takes an API key and is metered
-# on a free tier that has nothing to do with GCP billing: 15 requests a minute
-# on flash-lite, and only 20 A DAY on flash. That daily cap is the reason this
-# project ran on the weaker lite model throughout.
-#
-# Vertex (aiplatform.googleapis.com) is the same family through GCP, billed to
-# the project and paid by credits. Higher quotas, and `gemini-3.5-flash` is
-# actually reachable. It is also the only one of the two that shows up as Google
-# Cloud usage at all - the API-key path never touches the project.
-#
-# So Vertex first when a project is configured, AI Studio second, and the
-# OpenAI-compatible chain above as the last resort.
-
-VERTEX_LOCATION = os.environ.get("POCKETCHANGE_VERTEX_LOCATION", "asia-south1")
-VERTEX_MODEL = os.environ.get("POCKETCHANGE_VERTEX_MODEL", "gemini-3.5-flash")
-# Judgement is rare and high-stakes; decomposition is frequent and structural.
-# Defaults to the same model so nothing changes unless someone opts in - the
-# tiering is available, not assumed.
-VERTEX_JUDGE_MODEL = os.environ.get("POCKETCHANGE_VERTEX_JUDGE_MODEL", "") or VERTEX_MODEL
-
-
-def vertex_available() -> bool:
-    """A project to bill, and not explicitly switched off."""
-    if os.environ.get("POCKETCHANGE_NO_VERTEX"):
-        return False
-    return bool(os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip())
-
-
-def gemini_client(fallback_model: str, *, tier: str = "work"):
-    """(client, model, flavour) for whichever door is open.
-
-    Returns the flavour so a caller can say which one answered rather than
-    leaving it to be guessed from timing.
-    """
-    from google import genai
-
-    if vertex_available():
-        try:
-            client = genai.Client(
-                vertexai=True,
-                project=os.environ["GOOGLE_CLOUD_PROJECT"].strip(),
-                location=VERTEX_LOCATION,
-            )
-            model = VERTEX_JUDGE_MODEL if tier == "judge" else VERTEX_MODEL
-            return client, model, "vertex"
-        except Exception:  # noqa: BLE001 - fall through to the API key
-            pass
-
-    return genai.Client(api_key=os.environ["GOOGLE_API_KEY"]), fallback_model, "aistudio"
 
 
 def configured() -> list[Provider]:
