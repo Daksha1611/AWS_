@@ -2077,7 +2077,15 @@ def replay_payment(audit_seq: int) -> dict[str, Any]:
         "same_order": response.order_id == first["order_id"],
         "committed_before_paise": before.committed_paise,
         "committed_after_paise": after.committed_paise,
-        "charged_twice": after.committed_paise != before.committed_paise,
+        # NOT `after.committed_paise != before.committed_paise`. That diffs the
+        # whole mandate, so any other payment settling on it between the two
+        # reads above - nothing to do with this replay - reads identically to
+        # this replay having charged again. `response.replayed` is the signal
+        # that is actually about this call: pay() sets it inside the same
+        # idempotency check that decides whether a new reservation opens at
+        # all, so it is false exactly when this call moved money, whatever
+        # else happened to the mandate in the meantime.
+        "charged_twice": not response.replayed,
     }
 
 

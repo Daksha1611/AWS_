@@ -586,6 +586,67 @@ def test_replay_returns_the_same_order_and_does_not_charge_twice(client, monkeyp
     assert body["mandate_id"]
 
 
+def test_charged_twice_is_not_fooled_by_a_sibling_payment(client, monkeypatch):
+    """The exact bug: `charged_twice` used to diff the mandate's whole
+    committed total, so a payment landing on the SAME mandate between
+    replay_payment()'s two ledger reads - nothing to do with this replay -
+    was indistinguishable from this replay having charged again.
+
+    Only a funnel-driven payment is registered as replayable at all (see
+    `_pay_internal`), so this needs `/runs`, same as the test above. The
+    sibling settlement is fabricated on the SECOND read rather than actually
+    reserved on the mandate: a full run already commits the whole cap by
+    design (that IS the ceiling this project proves), so there is no real
+    headroom left to stage a genuine one against, and this is the same
+    interleaving either way - `before` genuinely precedes it, `after`
+    genuinely reflects it, and the fix must still say `charged_twice: False`,
+    because nothing this replay call did moved money.
+    """
+    from dataclasses import replace
+
+    from pocketchange import events as ev
+    from pocketchange.monitor import ScriptedMonitor, Verdict
+
+    monkeypatch.setattr(ev, "bus", ev.EventBus(history=10_000))
+    gateway.state.monitor = ScriptedMonitor(verdict=Verdict.ALLOW)
+    body = client.post("/runs", json={
+        "task": "Quarterly consumables restock", "budget_paise": 90_000 * RUPEE,
+        "fan_out": 3, "floor_paise": 11_000 * RUPEE, "decomposer": "departmental",
+    }).json()
+    assert _wait_for(lambda: any(e.kind == ev.SETTLED for e in ev.bus.history()))
+    _wait_until_quiet(
+        lambda: gateway.state.ledger.state(body["mandate_id"]).committed_paise)
+
+    paid = [e for e in gateway.state.audit.entries()
+            if e.tool == "pay" and e.decision is Decision.ALLOWED]
+    assert paid
+    audit_seq = paid[0].seq
+
+    real_state = gateway.state.ledger.state
+    calls = {"n": 0}
+
+    def a_sibling_settles_strictly_after_the_first_read(mandate_id):
+        calls["n"] += 1
+        result = real_state(mandate_id)
+        if calls["n"] == 1:
+            return result
+        # Only the SECOND read (replay_payment()'s "after") sees this -
+        # exactly what "landed between the two reads" means.
+        return replace(result, committed_paise=result.committed_paise + 1 * RUPEE)
+
+    monkeypatch.setattr(
+        gateway.state.ledger, "state", a_sibling_settles_strictly_after_the_first_read)
+
+    out = client.post(f"/replay/{audit_seq}").json()
+
+    assert out["second"]["replayed"] is True
+    assert out["committed_before_paise"] != out["committed_after_paise"], (
+        "the fabricated sibling above should show up as a difference - if it "
+        "didn't, this test is not exercising the race"
+    )
+    assert out["charged_twice"] is False
+
+
 def test_replay_of_an_unknown_entry_is_a_404(client):
     assert client.post("/replay/99999").status_code == 404
 
