@@ -9,7 +9,8 @@ assume the **$100 of AWS credits** on the account.
 
 ## Where it stands
 
-Done and on `worktree-aws-port` (PR #1):
+**Merged to `main`** (PR #1, merge commit `ecdeb98`, 2026-09-18). A judge landing
+on the repo now sees the AWS code.
 
 - Bedrock, Strands, Cedar and DynamoDB in place; 528 tests passing
 - `scripts/smoke_dynamodb.py` 9/9 against a real DynamoDB Local
@@ -19,13 +20,13 @@ Done and on `worktree-aws-port` (PR #1):
 Not done: **Bedrock has never been called.** Nothing below matters until that is
 true, so it is first.
 
+Housekeeping, whenever: the `worktree-aws-port` branch still exists and can be
+deleted; a local clone sitting on the pre-merge commit needs `git pull`.
+
 ---
 
 ## 1 · Before anything else (≈30 min, ~$0.50)
 
-- [ ] **Merge PR #1.** `main` is still on the pre-port commit. Everything below
-      assumes the branch is merged, and a judge landing on `main` today sees the
-      old Google Cloud code.
 - [ ] **Request Bedrock model access.** Console → Bedrock → Model access, in the
       region you will use. **Do this first regardless of everything else** — it
       is a per-account, per-region approval and it is not instant. Request at
@@ -252,7 +253,7 @@ Already written up in `PORTING.md` §5 and `HACKATHON.md`. The short list:
 
 ## If you only have a day
 
-1. Merge PR #1, get Bedrock access, verify the model ids (§1)
+1. Get Bedrock access, verify the model ids resolve, run `eval.monitor` once (§1)
 2. Record the video (§6)
 3. Submit to **Build It**
 
