@@ -131,10 +131,14 @@ keep running, and it is on the hackathon's Ship It service list. `Dockerfile`
 already builds the console and the gateway into one image, so there is one URL
 and no CORS to configure.
 
-- [ ] **Rewrite or drop `deploy/template.yaml`.** Either keep it as a
-      DynamoDB-table-only stack and deploy the service with App Runner, or
-      delete it. Do not leave a Lambda template implying an architecture that
-      would not work. **~1 hour.**
+- [x] **Rewrite `deploy/template.yaml`.** Dropped the Lambda function and
+      HTTP API; the table stays, and an `AWS::AppRunner::Service` plus its
+      two IAM roles (ECR pull, runtime) replace them. `KeySecretName` is
+      named as a parameter but never created here — the service mints it on
+      its own first boot (`pocketchange/secrets.py`), the same pattern as
+      `dynamo.create_table_if_absent()`. Still unvalidated: no AWS account
+      behind this machine, so only a local YAML parse, not
+      `aws cloudformation validate-template`.
 
 ### Steps
 

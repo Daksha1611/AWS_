@@ -49,9 +49,16 @@ cd frontend && npm ci && npm run dev     # http://localhost:5173
 
 ## 2. What deploying it would need
 
-`template.yaml` is in this directory and has **never been deployed**. `sam
-validate` has not been run against it. It is a design document that happens to
-be executable, and the list below is the part that matters more than the YAML.
+`template.yaml` is in this directory and has **never been deployed** — there is
+no AWS account behind the machine this was written on, so not even
+`aws cloudformation validate-template` has been run against it, only a local
+YAML parse. It targets **App Runner**, not Lambda: the funnel keeps running on
+a background thread after `POST /runs` has already answered, and Lambda
+freezes execution the instant the response returns, so the tree would simply
+stop growing wherever it had reached. `/stream` is Server-Sent Events, which
+API Gateway does not do comfortably either. It is a design document that
+happens to be executable, and the list below is the part that matters more
+than the YAML.
 
 ### Things you would have to supply
 
@@ -59,7 +66,8 @@ be executable, and the list below is the part that matters more than the YAML.
 |---|---|
 | An AWS account | with Bedrock **model access granted** for the two model ids in `template.yaml`. This is a per-account, per-region request in the Bedrock console and it is not instant, so it is the item to start first. |
 | A region that serves them | model availability is not uniform. `us-east-1` is the safe default; `ap-south-1` is closer to the rupee prices this project quotes but serves fewer models. |
-| SAM CLI and credentials | `sam build && sam deploy --guided`, with a deploy principal allowed to create the table, the function, the HTTP API and the role. |
+| An image already pushed | App Runner has no build-from-source step: `docker build`, `aws ecr create-repository`, `docker push`, *then* the stack — TODO.md §4 has the exact commands. `ImageIdentifier` in `template.yaml` is that image's URI. |
+| Deploy credentials | `aws cloudformation deploy`, with a principal allowed to create the table, the App Runner service, and the two IAM roles. No SAM CLI needed — nothing in the template is a SAM resource type. |
 | Razorpay **test** keys | optional. Without them the rail is a simulation and `/facts` reports `"rail": "fake"` rather than pretending otherwise. Never live keys — nothing in this project should move real money. |
 
 ### Things that must change before it is honest to call it deployed
@@ -67,21 +75,23 @@ be executable, and the list below is the part that matters more than the YAML.
 These are not deployment chores; they are places where the current code is
 correct for a laptop and wrong for a service.
 
-1. **The root signing key.** `POCKETCHANGE_EPHEMERAL_KEYS=1` generates a key per
-   instance. On a laptop that is right. In Lambda it means every cold start
-   silently revokes every live mandate, because tokens signed by the previous
-   key no longer verify. This needs KMS or Secrets Manager, and it is the single
-   biggest gap.
+1. ~~**The root signing key.**~~ Fixed: `pocketchange/secrets.py` fetches it
+   from Secrets Manager instead of a per-instance disk file, so a redeploy or
+   a second instance scaled out for load signs with the same key rather than
+   silently revoking every live mandate. `template.yaml` scopes
+   `InstanceRole` to exactly that one secret.
 
 2. **The in-process stores.** The ledger, the counterparty book and the standing
    orders are on DynamoDB. Approvals (`approvals.py`) and the agent registry
    (`registry.py`) are not — both say in their own docstrings that they are
    shaped so a durable store can replace them, and neither has been. A payment
-   held for human approval would not survive the container that held it.
+   held for human approval would not survive the container that held it. Still
+   open.
 
-3. **Concurrency.** Two Lambda instances share the DynamoDB table, which is
-   fine — that is what the conditional writes are for — but they do not share
-   the in-process state above, so the two must be fixed together.
+3. **Concurrency.** Every App Runner instance shares the DynamoDB table, which
+   is fine — that is what the conditional writes are for — and now shares the
+   root key too. They do not share the in-process approvals/registry state
+   above, so #2 is the same fix either way.
 
 4. **The demo write-gate.** `X-Demo-Token` is a brake against a crawler draining
    a shared model quota. It is not authentication, it ships inside a page anyone
@@ -91,7 +101,9 @@ correct for a laptop and wrong for a service.
 
 Effectively nothing at demo scale, and it is worth saying why rather than
 quoting a number: DynamoDB on-demand bills per request and this makes a handful
-per payment; Lambda and HTTP API have free tiers far above a demo's traffic; the
-only line item that is not rounding error is Bedrock, billed per token, which is
-why the monitor runs on the smallest model and why `/runs` reports
-`expected_model_calls` before a run starts rather than after.
+per payment; App Runner at 1 vCPU / 2 GB is roughly $0.07/hr, a few dollars for
+a multi-day event if left running - pause or delete the service between demos,
+the same advice TODO.md §5 gives; the only line item that is not rounding error
+is Bedrock, billed per token, which is why the monitor runs on the smallest
+model and why `/runs` reports `expected_model_calls` before a run starts rather
+than after.
