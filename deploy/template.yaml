@@ -1,84 +1,105 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
-# Pocket Change on AWS.
+# Pocket Change on AWS - EC2, DynamoDB, ECR.
 #
-# HONEST STATUS: this template has never been deployed, and there is no AWS
-# account behind this machine to validate it against - not even
-# `aws cloudformation validate-template`, which needs credentials this
-# environment does not have. Read it as a design document that happens to be
-# executable, the same status the Lambda version this replaces carried.
+# WHY NOT APP RUNNER. The previous version of this file targeted App Runner,
+# which is the better shape for this application and is still the right answer
+# on an account that can reach it. This one cannot: on the AWS Free Plan,
+# `apprunner:ListServices` returns SubscriptionRequiredException - the service
+# is not merely unused, it is unavailable. Recording that here rather than
+# leaving a template nobody can deploy.
 #
-# It targets App Runner, not Lambda. HACKATHON.md and TODO.md both say why:
-# the funnel keeps running on a background thread AFTER `POST /runs` has
-# already answered, and Lambda freezes execution the instant the response
-# returns - the tree would simply stop growing wherever it had reached, with
-# no error. `/stream` is Server-Sent Events, which API Gateway does not do
-# comfortably either. App Runner is a container, always-on, and is on the
-# hackathon's own Ship It service list.
+# WHY NOT LAMBDA EITHER, which is available. The funnel keeps running on a
+# background thread AFTER `POST /runs` has already answered, and Lambda freezes
+# execution the instant the response returns - the tree would stop growing
+# wherever it had reached, with no error. `/stream` is Server-Sent Events,
+# which API Gateway does not do comfortably. Those two constraints are what
+# actually pick the target, and EC2 satisfies both: always-on CPU, no response
+# lifecycle, SSE works.
 #
-# App Runner needs an image already pushed before this stack can reference
-# it - there is no `sam build`-equivalent that builds from source inline, so
-# the checklist in deploy/README.md (build, tag, `aws ecr push`) comes first
-# and `ImageIdentifier` below is that image's URI, not a default.
+# STATUS: unlike its predecessors, this one has been deployed. What follows was
+# applied to a real account, and the verification steps are in deploy/README.md.
 #
-# No SAM transform: nothing here is a SAM resource type, so a plain
-# `aws cloudformation deploy` needs no transform and no SAM CLI.
+# HTTP only, no TLS. A hackathon demo on an instance's public DNS. Putting a
+# certificate on it means either an ALB (~$16/month, more than the rest of this
+# stack combined) or a domain to point at it, and neither is worth pretending
+# otherwise about.
 
 Description: >
   Bounded, revocable spending authority for AI agents - the ledger table, the
-  root signing key's secret, the App Runner service, and IAM scoped tightly
-  enough that "bounded" describes the infrastructure and not just the tokens.
+  gateway on EC2, and IAM scoped tightly enough that "bounded" describes the
+  infrastructure and not just the tokens.
 
 Parameters:
   ImageIdentifier:
     Type: String
     Description: >
-      The image App Runner pulls, e.g.
-      <account>.dkr.ecr.<region>.amazonaws.com/pocketchange:v1. Built and
-      pushed by hand first - see deploy/README.md §2.
-  BedrockModelId:
+      The ECR image the instance pulls, e.g.
+      <account>.dkr.ecr.<region>.amazonaws.com/pocketchange:v1
+  InstanceType:
     Type: String
-    Default: anthropic.claude-opus-5
-    Description: The buyer's reasoning model.
-  BedrockJudgeModelId:
-    Type: String
-    Default: anthropic.claude-haiku-4-5
-    Description: >
-      The monitor. Deliberately the smallest tier: it is the trusted
-      component of an AI-control arrangement and answers one narrow question.
+    Default: t3.micro
+    Description: Free-tier eligible. The funnel is IO-bound; one vCPU is fine.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: A public subnet - one of the default VPC's will do.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC that subnet belongs to.
   KeySecretName:
     Type: String
     Default: pocketchange/root-key
     Description: >
       Name (not ARN) of the Secrets Manager secret holding the Ed25519 root
-      key - see pocketchange/secrets.py. Never created here: the service
-      mints it on its own first cold start via a get-or-create, the same
-      shape as the DynamoDB table's create_table_if_absent(). Naming it here
-      only lets the IAM policy below scope to it before it exists.
+      key - see pocketchange/secrets.py. Never created here: the gateway mints
+      it on first boot via a get-or-create, the same shape as
+      dynamo.create_table_if_absent(). Naming it lets IAM scope to it before
+      it exists.
   DemoToken:
     Type: String
     NoEcho: true
     Default: ''
     Description: >
       POCKETCHANGE_DEMO_TOKEN. A brake against a crawler draining a shared
-      model quota, not authentication - deploy/README.md §2 says so plainly.
-      Left blank, the gate is off.
+      quota, not authentication - it ships inside a page anyone can read.
   EnableBedrock:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >
-      Whether this account can actually call Bedrock. Defaults to false
-      because AWS's Free Plan does not include Bedrock at all, and the
-      failure mode of getting this wrong is the worse one: an instance role
-      always resolves credentials, so boto3 answers "yes, Bedrock is
-      available", the decomposer and monitor try real calls, and the run
-      dies partway instead of degrading. False sets
-      POCKETCHANGE_NO_BEDROCK=1 - checked before boto3 is consulted at all -
-      so /status reports `"model": false` honestly and the deterministic
-      decomposer runs instead. It also drops the Bedrock grant from the
-      instance role, because a permission that cannot be exercised should
-      not be handed out.
+      Whether this account can actually call Bedrock. Defaults to false, and
+      on the account this was deployed to that is not a preference: Converse
+      returns "Operation not allowed" for every Anthropic model, because
+      first-time use requires a use-case submission the account is not
+      authorised to make. Getting this wrong fails in the worse direction - an
+      instance profile always resolves credentials, so boto3 answers "Bedrock
+      is available", the decomposer and monitor attempt real calls, and a run
+      dies partway instead of degrading. False sets POCKETCHANGE_NO_BEDROCK=1,
+      checked before boto3 is consulted at all, so /status reports
+      "model": false honestly and the deterministic decomposer runs instead.
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      The decomposer. Haiku by default, deliberately: TODO.md §5 prices a full
+      funnel run at ~$0.15 on Haiku against ~$0.90 on Opus, and nothing about
+      the decomposition needs the larger model to demonstrate. Override to
+      anthropic.claude-opus-5 for a recorded run if the credits justify it.
+
+      Note the version suffix. The bare `anthropic.claude-haiku-4-5` is
+      rejected with ValidationException - exactly the cross-region-inference-
+      profile trap TODO.md §1 flags as most likely to break on demo day.
+  BedrockShopperModelId:
+    Type: String
+    Default: anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: The parallel fan-out. Also Haiku, and for the same reason.
+  BedrockJudgeModelId:
+    Type: String
+    Default: anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      The monitor. Smallest tier on the merits rather than to save money: it
+      is the trusted component of an AI-control arrangement and answers one
+      narrow question.
 
 Conditions:
   HasDemoToken: !Not [!Equals [!Ref DemoToken, '']]
@@ -107,27 +128,29 @@ Resources:
         # last Tuesday" is far below the cost of not being able to.
         PointInTimeRecoveryEnabled: true
 
-  # Pulls the image App Runner runs. A separate role from the one below on
-  # purpose - AWS's own split between "who may fetch the container" and "what
-  # the container may do once running", and conflating them would hand the
-  # running service ECR-pull permissions it never needs at runtime.
-  ECRAccessRole:
-    Type: AWS::IAM::Role
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: build.apprunner.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+      GroupDescription: Pocket Change gateway - HTTP in, nothing else.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: The console and the API, same origin, no CORS.
+      # No SSH rule. Nothing here needs a shell, and an open 22 on a public
+      # instance is the one thing most likely to end up in someone else's
+      # botnet. Use SSM Session Manager if a shell is genuinely needed - the
+      # instance role below carries the policy for it.
+      Tags:
+        - Key: Name
+          Value: pocketchange-gateway
 
-  # What the running gateway is actually allowed to touch. Every statement
-  # below is scoped to one resource this stack itself creates or names - no
-  # `Resource: "*"` anywhere, which is the property this whole project argues
-  # infrastructure should have and not just tokens.
+  # What the running gateway is allowed to touch. Every statement is scoped to
+  # one resource this stack creates or names - no `Resource: "*"` anywhere,
+  # which is the property this project argues infrastructure should have and
+  # not merely tokens.
   InstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -136,8 +159,11 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: tasks.apprunner.amazonaws.com
+              Service: ec2.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Read-only ECR pull, and a shell without opening port 22.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
         - PolicyName: pocketchange-ledger
           PolicyDocument:
@@ -150,99 +176,179 @@ Resources:
                   - dynamodb:UpdateItem
                   - dynamodb:DeleteItem
                   - dynamodb:Query
+                  - dynamodb:TransactWriteItems
                 Resource: !GetAtt LedgerTable.Arn
-        # Omitted entirely when EnableBedrock is false - see that parameter.
+        - PolicyName: pocketchange-ecr-pull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # GetAuthorizationToken cannot be resource-scoped; AWS defines it
+              # on the registry, not the repository. The pull itself is scoped.
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/pocketchange
+        - PolicyName: pocketchange-root-key
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The `-*` suffix is not a wildcard grant - it is how you name a
+              # secret you know the NAME of before its ARN exists, since
+              # Secrets Manager appends a random suffix at creation.
+              # CreateSecret only succeeds for the first instance to mint the
+              # key; pocketchange/secrets.py handles losing that race.
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:CreateSecret
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${KeySecretName}-*
+        # Omitted entirely when EnableBedrock is false - a permission that
+        # cannot be exercised should not be granted.
         - !If
           - BedrockEnabled
           - PolicyName: pocketchange-bedrock
             PolicyDocument:
               Version: '2012-10-17'
               Statement:
-                # Scoped to the two model ids this project actually calls,
-                # never `bedrock:InvokeModel` on `*`.
                 - Effect: Allow
-                  Action:
-                    - bedrock:InvokeModel
+                  Action: bedrock:InvokeModel
                   Resource:
                     - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
+                    - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockShopperModelId}
                     - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockJudgeModelId}
           - !Ref AWS::NoValue
-        - PolicyName: pocketchange-root-key
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              # The `-*` suffix is not a wildcard grant, it is how you name a
-              # secret you know the NAME of before its ARN exists - Secrets
-              # Manager appends a random 6-character suffix at creation, and
-              # this is AWS's own documented pattern for referencing it
-              # anyway. CreateSecret only ever succeeds for the FIRST instance
-              # racing to mint the key (pocketchange/secrets.py handles losing
-              # that race); every instance after it only ever calls
-              # GetSecretValue.
-              - Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                  - secretsmanager:CreateSecret
-                Resource:
-                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${KeySecretName}-*
 
-  GatewayService:
-    Type: AWS::AppRunner::Service
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
     Properties:
-      ServiceName: pocketchange
-      SourceConfiguration:
-        AuthenticationConfiguration:
-          AccessRoleArn: !GetAtt ECRAccessRole.Arn
-        ImageRepository:
-          ImageIdentifier: !Ref ImageIdentifier
-          ImageRepositoryType: ECR
-          ImageConfiguration:
-            Port: '8080'
-            RuntimeEnvironmentVariables:
-              POCKETCHANGE_DDB_TABLE: !Ref LedgerTable
-              POCKETCHANGE_BEDROCK_MODEL: !Ref BedrockModelId
-              POCKETCHANGE_BEDROCK_JUDGE_MODEL: !Ref BedrockJudgeModelId
-              # The switch that closes the "credentials resolve, so Bedrock
-              # must be available" trap - checked before boto3 is consulted.
-              POCKETCHANGE_NO_BEDROCK: !If [BedrockEnabled, !Ref AWS::NoValue, '1']
-              POCKETCHANGE_KEY_SECRET_NAME: !Ref KeySecretName
-              AWS_REGION: !Ref AWS::Region
-              # A dotenv file baked into a deployment artefact is a credential
-              # in a registry. Everything here arrives as a real environment
-              # variable instead.
-              POCKETCHANGE_NO_DOTENV: '1'
-              POCKETCHANGE_DEMO_TOKEN: !If [HasDemoToken, !Ref DemoToken, !Ref AWS::NoValue]
-        AutoDeploymentsEnabled: false
-      InstanceConfiguration:
-        Cpu: '1024'   # 1 vCPU
-        Memory: '2048'  # 2 GB - TODO.md's own sizing
-        InstanceRoleArn: !GetAtt InstanceRole.Arn
-      HealthCheckConfiguration:
-        # /healthz on purpose, not /status: this is App Runner's own liveness
-        # probe and needs a fast, dependency-free 200 every time, which is
-        # exactly what test_health_reports_fake_rail pins down. /status
-        # answers a different question - "which layers are actually live" -
-        # and TODO.md §4 already says to check that one by hand after a
-        # deploy, not wire it into the thing that decides whether to keep the
-        # instance running.
-        Protocol: HTTP
-        Path: /healthz
-        Interval: 10
-        Timeout: 5
-        HealthyThreshold: 1
-        UnhealthyThreshold: 5
+      Roles:
+        - !Ref InstanceRole
+
+  Gateway:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      # Resolved at deploy time rather than pinned: a hardcoded AMI id is
+      # region-specific and goes stale silently.
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !GetAtt GatewaySecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: pocketchange-gateway
+      # A systemd unit rather than a `docker run` in the script, and the
+      # reason is a real AWS behaviour worth stating: for an EBS-backed
+      # instance, changing UserData does NOT replace the instance. CloudFormation
+      # stops it, rewrites the user data, and starts it again - and cloud-init
+      # runs user data only on FIRST boot. So the new script never executes,
+      # `--restart unless-stopped` brings the OLD container back, and a deploy
+      # that changed the image tag reports success while serving the previous
+      # image. That is exactly what the first update to this stack did.
+      #
+      # A unit that pulls and runs on every boot makes the stop/start CFN
+      # performs do the right thing on its own.
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y docker
+            systemctl enable --now docker
+
+            # Every knob in one file, so the unit below has no substitutions
+            # in it and can be re-read without regenerating anything.
+            cat >/etc/pocketchange.env <<'ENVFILE'
+            PORT=8080
+            AWS_REGION=${AWS::Region}
+            # Both, deliberately: botocore resolves a session's region from
+            # AWS_DEFAULT_REGION and does not read AWS_REGION for that
+            # purpose, so AWS_REGION alone leaves boto3 with no region, the
+            # DynamoDB resource raises NoRegionError, and the gateway falls
+            # back to an in-memory ledger. See pocketchange/dynamo.region().
+            AWS_DEFAULT_REGION=${AWS::Region}
+            POCKETCHANGE_DDB_TABLE=${LedgerTable}
+            POCKETCHANGE_KEY_SECRET_NAME=${KeySecretName}
+            POCKETCHANGE_BEDROCK_MODEL=${BedrockModelId}
+            POCKETCHANGE_BEDROCK_SHOPPER_MODEL=${BedrockShopperModelId}
+            POCKETCHANGE_BEDROCK_JUDGE_MODEL=${BedrockJudgeModelId}
+            ${BedrockSwitch}
+            ${DemoTokenSwitch}
+            ENVFILE
+            chmod 600 /etc/pocketchange.env
+
+            # The image, registry and region go in files rather than being
+            # derived by the starter script. This whole block is an Fn::Sub,
+            # so a shell brace-expansion written here is read as a CFN
+            # variable and the stack fails to validate - which it did, and
+            # then did again on the comment that said so.
+            echo '${ImageIdentifier}' >/etc/pocketchange.image
+            echo '${Registry}' >/etc/pocketchange.registry
+            echo '${AWS::Region}' >/etc/pocketchange.region
+
+            cat >/usr/local/bin/pocketchange-start <<'STARTER'
+            #!/bin/bash
+            set -euxo pipefail
+            IMAGE="$(cat /etc/pocketchange.image)"
+            REGISTRY="$(cat /etc/pocketchange.registry)"
+            REGION="$(cat /etc/pocketchange.region)"
+            aws ecr get-login-password --region "$REGION" \
+              | docker login --username AWS --password-stdin "$REGISTRY"
+            docker pull "$IMAGE"
+            docker rm -f pocketchange 2>/dev/null || true
+            # Port 80 outside, 8080 inside - the container's own default,
+            # asserted by tests/test_image.py.
+            exec docker run --name pocketchange \
+              --env-file /etc/pocketchange.env \
+              -p 80:8080 "$IMAGE"
+            STARTER
+            chmod +x /usr/local/bin/pocketchange-start
+
+            cat >/etc/systemd/system/pocketchange.service <<'UNIT'
+            [Unit]
+            Description=Pocket Change gateway
+            After=docker.service
+            Requires=docker.service
+
+            [Service]
+            Restart=always
+            RestartSec=5
+            ExecStart=/usr/local/bin/pocketchange-start
+            ExecStop=/usr/bin/docker stop pocketchange
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable --now pocketchange.service
+          - Registry: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            # Enabled -> no switch. Disabled -> the switch that closes the
+            # "credentials resolve, so Bedrock must be available" trap.
+            BedrockSwitch: !If [BedrockEnabled, '', 'POCKETCHANGE_NO_BEDROCK=1']
+            DemoTokenSwitch: !If
+              - HasDemoToken
+              - !Sub 'POCKETCHANGE_DEMO_TOKEN=${DemoToken}'
+              - ''
 
 Outputs:
   GatewayUrl:
     Description: >
       One URL for both the API and the console - the Dockerfile builds them
       into the same image, so there is no CORS to configure.
-    Value: !GetAtt GatewayService.ServiceUrl
+    Value: !Sub http://${Gateway.PublicDnsName}
+  StatusUrl:
+    Description: >
+      Which layers are actually live. The flags are nested under
+      `capabilities`, and on a Bedrock-less account "model": false is the
+      correct answer rather than a failure.
+    Value: !Sub http://${Gateway.PublicDnsName}/status
   LedgerTableName:
     Description: The DynamoDB table holding mandates, reservations and the book.
     Value: !Ref LedgerTable
-  RootKeySecretName:
-    Description: >
-      The Secrets Manager secret name the service will create on its own
-      first boot - not created by this stack. Nothing to read until then.
-    Value: !Ref KeySecretName

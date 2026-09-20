@@ -46,7 +46,7 @@ def test_the_image_does_not_bake_in_a_dotenv_exception():
     .env file reaching a deployed container is a credential arriving from
     somewhere nobody configured.
     """
-    assert re.search(r"^\s*POCKETCHANGE_NO_DOTENV=1", DOCKERFILE.read_text(), re.M)
+    assert re.search(r"^\s*POCKETCHANGE_NO_DOTENV=1", DOCKERFILE.read_text(), re.MULTILINE)
 
 
 def test_the_policies_are_copied_into_the_image():
@@ -54,16 +54,49 @@ def test_the_policies_are_copied_into_the_image():
     built without the policy set answers 503 to every payment. The Dockerfile
     says so in a comment; this is the version that fails a build.
     """
-    assert re.search(r"^COPY policies/", DOCKERFILE.read_text(), re.M)
+    assert re.search(r"^COPY policies/", DOCKERFILE.read_text(), re.MULTILINE)
 
 
 def test_the_template_port_matches_the_image_port():
-    """App Runner routes to one port and the container listens on one port.
+    """The stack publishes one port and the container listens on one port.
     Disagreeing is a health check that never passes and a service that never
     goes live, for a reason neither file states on its own.
+
+    This caught itself once already: the assertion was written against the
+    App Runner template's `Port:` field and survived the rewrite to EC2,
+    where the same fact is expressed as a docker `-p 80:<port>` mapping.
     """
-    image_port = re.search(r"^ENV PORT=(\d+)", DOCKERFILE.read_text(), re.M)
+    image_port = re.search(r"^ENV PORT=(\d+)", DOCKERFILE.read_text(), re.MULTILINE)
     assert image_port, "the Dockerfile no longer states a default PORT"
-    assert f"Port: '{image_port.group(1)}'" in TEMPLATE.read_text(), (
-        f"deploy/template.yaml does not route to port {image_port.group(1)}"
+    port = image_port.group(1)
+    template = TEMPLATE.read_text()
+    published = re.search(rf"-p\s+\d+:{port}\b", template) or re.search(
+        rf"Port: '{port}'", template
+    )
+    assert published, f"deploy/template.yaml does not route to port {port}"
+    # The container is told its port by env var, whether that is a `-e` flag
+    # or a line in the --env-file the systemd unit reads.
+    listens = re.search(rf"^\s*PORT={port}\s*$", template, re.MULTILINE) or (
+        f"-e PORT={port}" in template
+    )
+    assert listens, f"the template does not tell the container to listen on {port}"
+
+
+def test_the_template_sets_both_region_variables():
+    """AWS_REGION alone is not enough, and the failure is silent.
+
+    botocore resolves a session's region from AWS_DEFAULT_REGION; 1.43.98
+    does not read AWS_REGION for that purpose at all. A container given only
+    AWS_REGION therefore has a correct-looking environment and a session with
+    region_name of None, `boto3.resource("dynamodb")` raises NoRegionError,
+    and `ledger.from_env()` falls back to the in-memory ledger - which is
+    exactly what the first EC2 deployment did while an empty DynamoDB table
+    sat beside it. dynamo.region() now resolves this independently, and the
+    template sets both; either alone would fix it, and both is cheap.
+    """
+    template = TEMPLATE.read_text()
+    assert re.search(r"^\s*(-e )?AWS_REGION=", template, re.MULTILINE)
+    assert re.search(r"^\s*(-e )?AWS_DEFAULT_REGION=", template, re.MULTILINE), (
+        "only AWS_REGION is set; botocore reads AWS_DEFAULT_REGION for the "
+        "session region, so the ledger would silently fall back to memory"
     )
