@@ -46,6 +46,7 @@ from .approvals import AlreadyResolved, ApprovalStore, UnknownApproval
 from .audit import AuditLog, AuditTampered, Decision
 from .idempotency import ReplayStore, derive_key
 from .ledger import InsufficientBudget, LedgerError, UnknownMandate
+from .ledger import fallback_reason as ledger_fallback_reason
 from .ledger import from_env as ledger_from_env
 from .monitor import Judgement, Situation, Verdict
 from .monitor import from_env as monitor_from_env
@@ -958,6 +959,14 @@ def capabilities() -> dict[str, Any]:
     """
     model = have_model()
     live = isinstance(state.rail, FakeRail) is False
+    # Which ledger is actually holding the money, and - if a durable one was
+    # asked for and not obtained - why not. This is reported for the same
+    # reason as everything else here, but it is the one layer whose quiet
+    # degradation survives inspection: a MemoryLedger answers every query
+    # correctly right up until the process restarts and the record of who was
+    # paid goes with it.
+    durable_ledger = type(state.ledger).__name__ == "DynamoLedger"
+    ledger_fault = ledger_fallback_reason()
     return {
         # The rail is the one that decides whether money is a simulation.
         "rail": "razorpay-test" if live else "fake",
@@ -967,13 +976,19 @@ def capabilities() -> dict[str, Any]:
         "monitor": "bedrock" if monitor_judges(state.monitor) else "unconfigured",
         "critic": "bedrock" if model else "unconfigured",
         "search": bool(os.environ.get("TAVILY_API_KEY")),
+        "ledger": "dynamodb" if durable_ledger else "memory",
+        # Present only when a durable ledger was configured and could not be
+        # built. Not-configured is a choice; configured-and-broken is a fault.
+        "ledger_fault": ledger_fault,
         # One sentence a console can print without having to reason about the
         # combination itself.
-        "degraded": None if model and live else _degraded_because(model, live),
+        "degraded": (None if model and live and not ledger_fault
+                     else _degraded_because(model, live, ledger_fault)),
     }
 
 
-def _degraded_because(model: bool, live_rail: bool) -> str:
+def _degraded_because(model: bool, live_rail: bool,
+                      ledger_fault: str | None = None) -> str:
     missing = []
     if not model:
         missing.append("no model is configured, so tasks split by a fixed "
@@ -981,6 +996,13 @@ def _degraded_because(model: bool, live_rail: bool) -> str:
                        "reads a plan")
     if not live_rail:
         missing.append("no Razorpay test keys, so orders are simulated")
+    if ledger_fault:
+        # Deliberately blunter than the others. The rest of this list is
+        # "a layer is absent"; this one is "a layer you asked for is broken
+        # and the spend record dies with this process".
+        missing.append("the durable ledger was configured but could not be "
+                       f"built, so spend is held IN MEMORY and will not "
+                       f"survive a restart ({ledger_fault})")
     return "; ".join(missing) + "."
 
 

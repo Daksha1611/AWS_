@@ -131,3 +131,50 @@ def test_a_racing_create_fetches_the_winner_instead_of_keeping_its_own(
     # process minted locally and then lost the race to store.
     assert bytes(result.private_key.to_bytes()) == winning_keypair_bytes
     assert calls["get"] == 2
+
+
+def test_dynamo_resolves_a_region_without_boto3s_help(monkeypatch):
+    """The trap that put a live deployment on the in-memory ledger.
+
+    Only AWS_REGION set - which botocore does not read for session region -
+    must still produce a usable region here, because dynamo.py resolves it
+    itself rather than leaving it to boto3.
+    """
+    from pocketchange import dynamo
+
+    monkeypatch.delenv("POCKETCHANGE_DDB_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.setenv("AWS_REGION", "ap-south-1")
+    assert dynamo.region() == "ap-south-1"
+
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
+    assert dynamo.region() == "eu-west-1"
+
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    assert dynamo.region() == dynamo.DEFAULT_REGION
+
+
+def test_a_broken_durable_ledger_is_reported_not_swallowed(monkeypatch):
+    """Configured-and-broken must not look like never-configured.
+
+    Both give you a MemoryLedger; only one of them means the spend record
+    dies with the process, and that one now says so.
+    """
+    from pocketchange import dynamo, ledger
+
+    monkeypatch.setattr(dynamo, "configured", lambda: True)
+
+    def explode():
+        raise RuntimeError("NoRegionError: You must specify a region.")
+
+    monkeypatch.setattr(dynamo, "table", explode)
+
+    got = ledger.from_env()
+    assert isinstance(got, ledger.MemoryLedger)
+    assert "NoRegionError" in (ledger.fallback_reason() or "")
+
+    # ...and not-configured stays silent, because that is a choice.
+    monkeypatch.setattr(dynamo, "configured", lambda: False)
+    ledger.from_env()
+    assert ledger.fallback_reason() is None

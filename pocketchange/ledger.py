@@ -597,17 +597,48 @@ def _as_reservation(mandate_id: str, item: dict) -> Reservation:
 # the opposite one.
 
 
+# Why the durable ledger was not used, when it was asked for and not obtained.
+# None means nothing went wrong: either DynamoDB is in use, or it was never
+# configured in the first place. Read by gateway.capabilities().
+_FALLBACK_REASON: str | None = None
+
+
+def fallback_reason() -> str | None:
+    """The exception that put this process on the in-memory ledger, if any.
+
+    A deployment that intended a durable ledger and silently got a volatile
+    one is the worst outcome this module has, because everything keeps working
+    right up until a restart eats the record of who was paid. So the reason is
+    kept and reported rather than swallowed.
+    """
+    return _FALLBACK_REASON
+
+
 def from_env() -> Ledger:
     """DynamoLedger when one is configured, MemoryLedger otherwise.
 
     Development and tests must never require cloud credentials, so absence of
     configuration degrades to in-memory rather than failing.
+
+    Configured-but-broken is a different case from not-configured, and used to
+    be indistinguishable: both returned a MemoryLedger and said nothing. That
+    is how the first EC2 deployment ran its whole funnel against an in-memory
+    ledger while a perfectly good DynamoDB table sat empty beside it - boto3
+    could not resolve a region (see dynamo.region()), the constructor raised,
+    and this function quietly handed back the volatile one. The fallback still
+    happens, because an unreachable store must not stop local work, but it no
+    longer happens quietly.
     """
+    global _FALLBACK_REASON
     from . import dynamo
 
     if not dynamo.configured():
+        _FALLBACK_REASON = None
         return MemoryLedger()
     try:
-        return DynamoLedger()
-    except Exception:  # noqa: BLE001 - unreachable storage must not stop local work
+        ledger = DynamoLedger()
+    except Exception as exc:  # noqa: BLE001 - unreachable storage must not stop local work
+        _FALLBACK_REASON = f"{type(exc).__name__}: {exc}"
         return MemoryLedger()
+    _FALLBACK_REASON = None
+    return ledger

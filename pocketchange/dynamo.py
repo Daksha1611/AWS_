@@ -48,6 +48,7 @@ from functools import lru_cache
 TABLE_ENV = "POCKETCHANGE_DDB_TABLE"
 ENDPOINT_ENV = "POCKETCHANGE_DDB_ENDPOINT"
 DEFAULT_TABLE = "pocketchange"
+DEFAULT_REGION = "us-east-1"
 
 
 def table_name() -> str:
@@ -57,6 +58,29 @@ def table_name() -> str:
 def endpoint() -> str | None:
     """A local DynamoDB, when one is configured. None means the real thing."""
     return os.environ.get(ENDPOINT_ENV, "").strip() or None
+
+
+def region() -> str:
+    """The region, resolved here rather than left to boto3.
+
+    This is not belt-and-braces. botocore resolves a session's region from
+    AWS_DEFAULT_REGION and *not* from AWS_REGION - 1.43.98 reads the second
+    one not at all - so a container started with only AWS_REGION set has a
+    correct-looking environment, `os.environ["AWS_REGION"]` returning the
+    right string, and `boto3.Session().region_name` of None. The resource
+    constructor then raises NoRegionError, `ledger.from_env()` catches it,
+    and the deployment quietly runs on the in-memory ledger.
+
+    That is not hypothetical; it is what the first EC2 deployment did, and
+    nothing in the logs said so. bedrock.py already resolved its own region
+    for the same class of reason. This is that fix, applied to the module
+    that holds the money.
+    """
+    for name in ("POCKETCHANGE_DDB_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return DEFAULT_REGION
 
 
 def configured() -> bool:
@@ -89,15 +113,16 @@ def table():
     """
     import boto3
 
-    kwargs = {}
+    # region_name unconditionally: see region() for why leaving this to
+    # boto3's own resolution puts the ledger in memory without saying so.
+    kwargs = {"region_name": region()}
     if endpoint():
         # DynamoDB Local accepts any credentials but boto3 still insists on
         # finding some, so a machine with no AWS config at all can run the demo.
-        kwargs = {
+        kwargs |= {
             "endpoint_url": endpoint(),
             "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", "local"),
             "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", "local"),
-            "region_name": os.environ.get("AWS_REGION", "us-east-1"),
         }
     return boto3.resource("dynamodb", **kwargs).Table(table_name())
 
@@ -119,13 +144,12 @@ def create_table_if_absent() -> bool:
     import boto3
     from botocore.exceptions import ClientError
 
-    kwargs = {}
+    kwargs = {"region_name": region()}
     if endpoint():
-        kwargs = {
+        kwargs |= {
             "endpoint_url": endpoint(),
             "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", "local"),
             "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", "local"),
-            "region_name": os.environ.get("AWS_REGION", "us-east-1"),
         }
     client = boto3.client("dynamodb", **kwargs)
     try:
