@@ -63,9 +63,26 @@ Parameters:
       POCKETCHANGE_DEMO_TOKEN. A brake against a crawler draining a shared
       model quota, not authentication - deploy/README.md §2 says so plainly.
       Left blank, the gate is off.
+  EnableBedrock:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether this account can actually call Bedrock. Defaults to false
+      because AWS's Free Plan does not include Bedrock at all, and the
+      failure mode of getting this wrong is the worse one: an instance role
+      always resolves credentials, so boto3 answers "yes, Bedrock is
+      available", the decomposer and monitor try real calls, and the run
+      dies partway instead of degrading. False sets
+      POCKETCHANGE_NO_BEDROCK=1 - checked before boto3 is consulted at all -
+      so /status reports `"model": false` honestly and the deterministic
+      decomposer runs instead. It also drops the Bedrock grant from the
+      instance role, because a permission that cannot be exercised should
+      not be handed out.
 
 Conditions:
   HasDemoToken: !Not [!Equals [!Ref DemoToken, '']]
+  BedrockEnabled: !Equals [!Ref EnableBedrock, 'true']
 
 Resources:
 
@@ -134,18 +151,22 @@ Resources:
                   - dynamodb:DeleteItem
                   - dynamodb:Query
                 Resource: !GetAtt LedgerTable.Arn
-        - PolicyName: pocketchange-bedrock
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              # Scoped to the two model ids this project actually calls,
-              # never `bedrock:InvokeModel` on `*`.
-              - Effect: Allow
-                Action:
-                  - bedrock:InvokeModel
-                Resource:
-                  - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
-                  - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockJudgeModelId}
+        # Omitted entirely when EnableBedrock is false - see that parameter.
+        - !If
+          - BedrockEnabled
+          - PolicyName: pocketchange-bedrock
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                # Scoped to the two model ids this project actually calls,
+                # never `bedrock:InvokeModel` on `*`.
+                - Effect: Allow
+                  Action:
+                    - bedrock:InvokeModel
+                  Resource:
+                    - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
+                    - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockJudgeModelId}
+          - !Ref AWS::NoValue
         - PolicyName: pocketchange-root-key
           PolicyDocument:
             Version: '2012-10-17'
@@ -181,6 +202,9 @@ Resources:
               POCKETCHANGE_DDB_TABLE: !Ref LedgerTable
               POCKETCHANGE_BEDROCK_MODEL: !Ref BedrockModelId
               POCKETCHANGE_BEDROCK_JUDGE_MODEL: !Ref BedrockJudgeModelId
+              # The switch that closes the "credentials resolve, so Bedrock
+              # must be available" trap - checked before boto3 is consulted.
+              POCKETCHANGE_NO_BEDROCK: !If [BedrockEnabled, !Ref AWS::NoValue, '1']
               POCKETCHANGE_KEY_SECRET_NAME: !Ref KeySecretName
               AWS_REGION: !Ref AWS::Region
               # A dotenv file baked into a deployment artefact is a credential

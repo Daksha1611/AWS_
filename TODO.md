@@ -173,7 +173,11 @@ Environment: `POCKETCHANGE_DDB_TABLE=pocketchange`,
 `POCKETCHANGE_DEMO_TOKEN` to gate writes.
 
 - [ ] **Check `/status` first, not `/`.** It reports which layers are actually
-      live. Want `"model": true` and `"monitor": "bedrock"`.
+      live — but the flags are **nested under `capabilities`**, not top level
+      (`curl -s $URL/status | jq .capabilities`). With Bedrock you want
+      `"model": true` and `"monitor": "bedrock"`; on a Free Plan account with
+      `EnableBedrock=false` the honest answer is `"model": false`,
+      `"monitor": "unconfigured"` and a `degraded` string saying why.
 - [ ] **Confirm a run survives the response.** Start a run, watch `/stream`, and
       check the tree keeps growing after `POST /runs` has returned. This is the
       thing Lambda would have broken.

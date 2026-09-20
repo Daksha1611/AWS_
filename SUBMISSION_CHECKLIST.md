@@ -42,8 +42,11 @@ spare.
       AWS credentials on the machine that wrote it, so only a local YAML
       parse, not `aws cloudformation validate-template`. `deploy/README.md`
       §2 and `TODO.md` §4 have the exact steps and the IAM shape.
-- [ ] **Check `/status`, not `/`, after it's up.** Want `"model": true` and
-      `"monitor": "bedrock"`.
+- [ ] **Check `/status`, not `/`, after it's up** — flags are nested under
+      `capabilities` (`curl -s $URL/status | jq .capabilities`). Deployed
+      with `EnableBedrock=false` the honest answer is `"model": false`,
+      `"monitor": "unconfigured"`, plus a `degraded` string saying why; that
+      is the expected state on a Free Plan account, not a failure.
 - [ ] **Confirm a run survives the response** — start a run, watch `/stream`,
       check the tree keeps growing after `POST /runs` has already answered.
       This is the exact failure the App Runner rewrite exists to avoid.
