@@ -229,6 +229,26 @@ Resources:
       Roles:
         - !Ref InstanceRole
 
+  # A submitted URL has to keep working. An instance's public DNS is
+  # reassigned on every stop/start - and a CloudFormation update that touches
+  # UserData performs exactly that - so the address in the submission form
+  # would rot without anyone touching the project. Free while attached to a
+  # running instance; billed only when allocated to nothing, which is the
+  # opposite of the mistake worth worrying about here.
+  GatewayAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: pocketchange-gateway
+
+  GatewayAddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt GatewayAddress.AllocationId
+      InstanceId: !Ref Gateway
+
   Gateway:
     Type: AWS::EC2::Instance
     Properties:
@@ -342,13 +362,13 @@ Outputs:
     Description: >
       One URL for both the API and the console - the Dockerfile builds them
       into the same image, so there is no CORS to configure.
-    Value: !Sub http://${Gateway.PublicDnsName}
+    Value: !Sub http://${GatewayAddress}
   StatusUrl:
     Description: >
       Which layers are actually live. The flags are nested under
       `capabilities`, and on a Bedrock-less account "model": false is the
       correct answer rather than a failure.
-    Value: !Sub http://${Gateway.PublicDnsName}/status
+    Value: !Sub http://${GatewayAddress}/status
   LedgerTableName:
     Description: The DynamoDB table holding mandates, reservations and the book.
     Value: !Ref LedgerTable

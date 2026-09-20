@@ -12,11 +12,20 @@
 [![SoK](https://img.shields.io/badge/SoK_vectors-10%2F12_defended-2f6b45)](#the-threat-model)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-4a5a51)](#licence)
 
-<sub>A working prototype, not production software. It runs **locally** — see
-[60-second start](#60-second-start). Payments are real API calls on Razorpay
-**test** mode; the code refuses live keys outright. Every number below is
-measured by a command in this repository, and the [Limitations](#limitations)
-section is not a formality.</sub>
+### **[▶ Live demo](http://52.206.159.167)**
+
+*Reads are open — browse the tree, ledger, audit trail and counterparty record
+without a token. On EC2, with the ledger on DynamoDB and the root signing key
+in Secrets Manager. Plain HTTP, and no model: that account cannot call Bedrock,
+so the deterministic decomposer runs and
+[`/status`](http://52.206.159.167/status) says so rather than implying a layer
+that is not there.*
+
+<sub>A working prototype, not production software. It also runs **locally**
+with no credentials at all — see [60-second start](#60-second-start). Payments
+are real API calls on Razorpay **test** mode; the code refuses live keys
+outright. Every number below is measured by a command in this repository, and
+the [Limitations](#limitations) section is not a formality.</sub>
 
 *Amazon Bedrock · Strands Agents SDK · Cedar · Amazon DynamoDB · Biscuit capability tokens · Razorpay test-mode payments*
 

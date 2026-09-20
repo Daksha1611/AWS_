@@ -1,10 +1,20 @@
 # Submission notes
 
-For **First Commit** (WeMakeDevs × AWS), **Build It** track — open source, local,
-no deployment.
+For **First Commit** (WeMakeDevs × AWS).
 
-Everything here is checkable from a clean clone. Where something is unverified,
+### **[▶ Live: http://52.206.159.167](http://52.206.159.167)**
+
+*HTTP, not HTTPS — see [Known gaps](#known-gaps). Reads are open; writes want
+the demo token the console already carries.*
+
+Everything here is checkable from a clean clone, and everything about the
+deployment is checkable against that address. Where something is unverified,
 it says so.
+
+**What is actually live there:** the gateway and console on EC2, the
+cumulative-spend ledger on DynamoDB, the Cedar policy at the money path, and
+the Ed25519 root key in Secrets Manager. **Not** Bedrock — that account cannot
+call it, and `/status` says so rather than pretending. Details below.
 
 ---
 
@@ -154,15 +164,52 @@ POCKETCHANGE_DDB_ENDPOINT=http://localhost:8000 \
 
 Stated here rather than discovered by a judge.
 
-- **Not deployed.** Build It track. `deploy/template.yaml` has never been
-  applied or even validated, and says so in its own header.
-- **Bedrock has never been called from this machine.** Every Bedrock path is
-  exercised by its tests and its offline branch only. It is the largest
+- **Bedrock is not running, and cannot be on this account.** Not an oversight
+  and not laziness: `bedrock:ListFoundationModels` succeeds and lists every
+  model this project wants, but `Converse` returns **"Operation not allowed"**
+  for all of them, because Anthropic models require a first-time use-case
+  submission that the account is not authorised to make — the console form
+  refuses with *"Your account is not authorized to perform this action."* So
+  the deployment runs with `EnableBedrock=false`, which sets
+  `POCKETCHANGE_NO_BEDROCK=1`, and `/status` reports `"model": false` with a
+  `degraded` string naming exactly what is missing. Every Bedrock code path
+  remains exercised by tests and its offline branch only. This is the largest
   untested surface in the project — `PORTING.md` §5.
-- **The root signing key is generated per instance.** Correct on a laptop, and
-  on a serverless platform it would silently revoke every live mandate on each
-  cold start. It belongs in KMS.
+- **App Runner was the intended target and is unavailable.** The AWS Free Plan
+  returns `SubscriptionRequiredException` for it. EC2 satisfies the same two
+  constraints that ruled out Lambda — always-on CPU for the funnel's
+  background thread, and SSE for `/stream` — so that is what the stack builds.
+- **HTTP, no TLS.** A certificate needs either an ALB (~$16/month, more than
+  the rest of this stack combined) or a domain to point at the address.
+  Neither was worth it for a demo, and saying so beats a self-signed
+  certificate nobody can verify.
 - **Approvals and the agent registry are still in process memory.** The ledger,
   the counterparty book and the standing orders are durable; those two are not.
+  A payment held for human approval does not survive a container restart —
+  which is exactly the flow worth demoing, so it is worth saying out loud.
+- **One instance, no redundancy.** `t3.micro`, one container. It restarts
+  itself (systemd + `docker pull` on boot) but nothing fails over.
 - **Payments are Razorpay test mode.** The code refuses `rzp_live_` keys
   outright, deliberately.
+
+### What the deployment did prove
+
+Stated because these were claims before and are now observations.
+
+- **The durable ledger is real.** A funnel run writes 28 items to DynamoDB in
+  the layout `pocketchange/dynamo.py` documents, and the committed total
+  survives `systemctl restart pocketchange` — the record of who was paid
+  outlives the process holding it.
+- **The root key is shared, not per-instance.** The gateway created
+  `pocketchange/root-key` in Secrets Manager on first boot, via the
+  get-or-create in `pocketchange/secrets.py`. This closes what `TODO.md`
+  called the single biggest gap in the project.
+- **And one thing the deployment caught that no test had.** The first deploy
+  ran an entire funnel against an **in-memory** ledger while an empty
+  DynamoDB table sat beside it, silently: botocore resolves a session's region
+  from `AWS_DEFAULT_REGION` and does not read `AWS_REGION`, so the resource
+  constructor raised `NoRegionError`, `ledger.from_env()` caught it, and
+  returned a `MemoryLedger`. Everything worked. Nothing was durable. The fix
+  is `dynamo.region()`, and the more important half is that `/status` now
+  reports which ledger is actually in use and why, because "configured and
+  broken" had been indistinguishable from "never configured".
