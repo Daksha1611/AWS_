@@ -22,11 +22,15 @@ FROM python:3.12-slim AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    # The container filesystem is ephemeral, so a persisted root key would be a
-    # different key on every cold start - which is a silent revocation of every
-    # live mandate. Generating one per instance is the honest behaviour, and it
-    # is why the limitations say this belongs in a KMS.
-    POCKETCHANGE_EPHEMERAL_KEYS=1 \
+    # POCKETCHANGE_EPHEMERAL_KEYS is deliberately NOT set here, and that is a
+    # correctness requirement rather than a preference. It used to be, back
+    # when a per-instance key was the only honest option on an ephemeral
+    # container filesystem. `pocketchange/secrets.py` closed that gap, but
+    # `gateway._root_keypair()` checks the ephemeral flag FIRST - so baking it
+    # into the image would silently win over Secrets Manager and hand every
+    # instance its own key again, which is the exact bug the secret exists to
+    # close. See tests/test_image.py.
+    #
     # .env is not shipped. A deployment injects real environment variables, and
     # a dotenv file baked into an image is a credential in a registry.
     POCKETCHANGE_NO_DOTENV=1
